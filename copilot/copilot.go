@@ -49,6 +49,11 @@ var (
 	EditorPluginVersion = "copilot-auth/1.0"
 	TimeoutSeconds      = 60.0
 	AllowProxy          = true
+
+	CacheDirFunc   func() string
+	OAuthTokenFunc func() string
+	UseGhCLIFunc   func() bool
+	AllowProxyFunc func() bool
 )
 
 // AuthError is raised when no usable Copilot OAuth token can be resolved.
@@ -82,6 +87,11 @@ func httpClient() *http.Client {
 // ---- cache paths -------------------------------------------------------- //
 
 func cacheDir() string {
+	if CacheDirFunc != nil {
+		if d := CacheDirFunc(); d != "" {
+			return d
+		}
+	}
 	if CacheDir != "" {
 		return CacheDir
 	}
@@ -89,7 +99,7 @@ func cacheDir() string {
 		return o
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".copilot-auth", "cache")
+	return filepath.Join(home, ".llmgw", "cache")
 }
 
 func ensureCacheDir() string {
@@ -130,6 +140,11 @@ func writeJSONSecret(path string, payload map[string]any) {
 // ---- OAuth token resolution --------------------------------------------- //
 
 func fromEnv() string {
+	if OAuthTokenFunc != nil {
+		if t := OAuthTokenFunc(); t != "" {
+			return t
+		}
+	}
 	if OAuthToken != "" {
 		return OAuthToken
 	}
@@ -149,7 +164,11 @@ func fromCache() string {
 }
 
 func fromGhCLI() string {
-	if !UseGhCLI {
+	useGh := UseGhCLI
+	if UseGhCLIFunc != nil {
+		useGh = UseGhCLIFunc()
+	}
+	if !useGh {
 		return ""
 	}
 	gh, err := exec.LookPath("gh")
@@ -167,6 +186,9 @@ func fromGhCLI() string {
 // AssertProxyAllowed raises AuthError unless the copilot proxy is enabled.
 func AssertProxyAllowed() error {
 	enabled := AllowProxy
+	if AllowProxyFunc != nil {
+		enabled = AllowProxyFunc()
+	}
 	if !enabled {
 		v := strings.ToLower(strings.TrimSpace(os.Getenv("LLMGW_EXPERIMENTAL_COPILOT_PROVIDER")))
 		enabled = v == "1" || v == "true" || v == "yes" || v == "on"
@@ -459,6 +481,10 @@ func ClearCachedCredentials() map[string]bool {
 
 // AuthStatus is a diagnostic snapshot for the /admin panel.
 func AuthStatus() map[string]any {
+	useGh := UseGhCLI
+	if UseGhCLIFunc != nil {
+		useGh = UseGhCLIFunc()
+	}
 	env := fromEnv()
 	cache := fromCache()
 	gh := fromGhCLI()
@@ -476,7 +502,7 @@ func AuthStatus() map[string]any {
 		"env_present":    env != "",
 		"cache_present":  cache != "",
 		"gh_cli_present": gh != "",
-		"use_gh_cli":     UseGhCLI,
+		"use_gh_cli":     useGh,
 		"cache_dir":      cacheDir(),
 	}
 }
