@@ -100,7 +100,8 @@ func TestSyntheticTransportDiagnosticsAreSanitized(t *testing.T) {
 	SessionTokenURL = "http://127.0.0.1:1/session?access_token=query-secret&owner=owner@example.test"
 	t.Cleanup(func() { SessionTokenURL = oldURL })
 	_, err := exchangeOAuthForSession("synthetic-oauth")
-	if err == nil || strings.Contains(err.Error(), "query-secret") || strings.Contains(err.Error(), "owner@example.test") || len([]rune(err.Error())) > maxAuthDiagnosticChars {
+	authErr := &AuthError{}
+	if err == nil || !errors.As(err, &authErr) || !authErr.Transport || strings.Contains(err.Error(), "query-secret") || strings.Contains(err.Error(), "owner@example.test") || len([]rune(err.Error())) > maxAuthDiagnosticChars {
 		t.Fatalf("unsafe transport error: %v", err)
 	}
 }

@@ -138,7 +138,8 @@ func TestSyntheticTransportQueryIsSanitized(t *testing.T) {
 	HTTPClient = func() *http.Client { return &http.Client{} }
 	t.Cleanup(func() { RevokeURL, HTTPClient = oldURL, oldClient })
 	err := Revoke("synthetic-client", "synthetic-refresh", "")
-	if err == nil || strings.Contains(err.Error(), "query-secret") || strings.Contains(err.Error(), "owner@example.test") || len([]rune(err.Error())) > maxAuthDiagnosticChars {
+	authErr := &AuthError{}
+	if err == nil || !errors.As(err, &authErr) || authErr.StatusCode != 0 || authErr.Code != "transport" || strings.Contains(err.Error(), "query-secret") || strings.Contains(err.Error(), "owner@example.test") || len([]rune(err.Error())) > maxAuthDiagnosticChars {
 		t.Fatalf("unsafe transport error: %v", err)
 	}
 }
