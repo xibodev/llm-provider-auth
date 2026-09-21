@@ -1,6 +1,6 @@
 # llm-provider-auth
 
-Modular Go credential resolvers, OAuth device flows, and session token brokers for LLM providers.
+Modular Go credential resolvers, OAuth flows, and session token brokers for LLM providers.
 
 ## Modules & Drivers
 
@@ -9,6 +9,9 @@ Each driver is an independent subpackage with zero unnecessary dependencies:
 - **`gcp`**: Google Cloud Service Account JWT RS256 token minter. **Zero Google Cloud SDK dependencies** (pure standard library `crypto/rsa` and `crypto/x509`).
 - **`copilot`**: GitHub Copilot OAuth Device Flow (`/login/device/code`), session exchange, token cache, and CLI bridge.
 - **`codex`**: OpenAI ChatGPT/Codex OAuth session flow, PKCE exchange, and automatic token refresh.
+- **`browseroauth`**: Storage-neutral browser OAuth primitives with caller-supplied endpoints and client configuration, PKCE S256, state generation, code exchange, and refresh.
+- **`antigravity`**: Storage-neutral Google Antigravity OAuth flow and typed Cloud Code Assist account/project discovery, built on `browseroauth`.
+- **`anthropic`**: Anthropic setup-token validation and request-header selection for setup tokens or API keys.
 
 ## Installation
 
@@ -20,7 +23,22 @@ go get github.com/xibodev/llm-provider-auth
 go get github.com/xibodev/llm-provider-auth/gcp
 go get github.com/xibodev/llm-provider-auth/copilot
 go get github.com/xibodev/llm-provider-auth/codex
+go get github.com/xibodev/llm-provider-auth/browseroauth
+go get github.com/xibodev/llm-provider-auth/antigravity
+go get github.com/xibodev/llm-provider-auth/anthropic
 ```
+
+`browseroauth` deliberately does not open a browser, run a callback listener, or
+persist tokens. The caller owns those concerns and supplies the redirect URI,
+OAuth endpoints, client credentials, scopes, and any provider-specific
+authorization or token parameters.
+
+`antigravity` likewise performs no browser, listener, storage, UI, environment,
+or file operations. The caller supplies its Google OAuth client ID, client
+secret, and redirect URI. The package supplies canonical scopes and endpoints,
+requests offline consent, exchanges and refreshes tokens, and discovers only
+the Cloud Code Assist project returned by Google. `CompleteAuthorization`
+validates callback state before exchanging the authorization code.
 
 ## Quick Start
 
