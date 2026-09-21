@@ -10,7 +10,7 @@ import (
 )
 
 func TestValidateSetupToken(t *testing.T) {
-	valid := SetupTokenPrefix + strings.Repeat("aB0_-", 4)
+	valid := SetupTokenPrefix + strings.Repeat("aB0_-", 16)
 	if err := ValidateSetupToken(valid); err != nil {
 		t.Fatalf("valid setup token rejected: %v", err)
 	}
@@ -18,7 +18,7 @@ func TestValidateSetupToken(t *testing.T) {
 		"wrong prefix": "sk-ant-api01-" + strings.Repeat("a", 40),
 		"short":        SetupTokenPrefix + "short",
 		"whitespace":   " " + valid,
-		"invalid char": SetupTokenPrefix + strings.Repeat("a", 20) + ".",
+		"invalid char": SetupTokenPrefix + strings.Repeat("a", 80) + ".",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := ValidateSetupToken(token); err == nil {
@@ -29,7 +29,7 @@ func TestValidateSetupToken(t *testing.T) {
 }
 
 func TestHeaderSourceUsesSetupTokenBearerAndOAuthBeta(t *testing.T) {
-	token := SetupTokenPrefix + strings.Repeat("a", 32)
+	token := SetupTokenPrefix + strings.Repeat("a", 80)
 	source, err := NewHeaderSource(token)
 	if err != nil {
 		t.Fatal(err)
