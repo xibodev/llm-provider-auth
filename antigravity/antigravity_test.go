@@ -20,7 +20,7 @@ import (
 const fixtureRedirectURI = "http://127.0.0.1:51121/oauth-callback"
 
 func TestAuthorizationURLUsesCanonicalGoogleFlow(t *testing.T) {
-	config := Config{ClientID: "fixture-client", ClientSecret: "fixture-secret", RedirectURI: fixtureRedirectURI}
+	config := Config{ClientID: "fixture-client", ClientSecret: "fixture-secret", ClientAuthMode: browseroauth.ClientAuthModeClientSecretPost, RedirectURI: fixtureRedirectURI}
 	authorization, err := config.AuthorizationURL()
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +55,7 @@ func TestScopesReturnsCanonicalIndependentCopies(t *testing.T) {
 }
 
 func TestAuthorizationURLAcceptsCallerOwnedCustomRedirectScheme(t *testing.T) {
-	config := Config{ClientID: "fixture-client", ClientSecret: "fixture-secret", RedirectURI: "fixture-app:/oauth/callback"}
+	config := Config{ClientID: "fixture-client", ClientSecret: "fixture-secret", ClientAuthMode: browseroauth.ClientAuthModeClientSecretPost, RedirectURI: "fixture-app:/oauth/callback"}
 	authorization, err := config.AuthorizationURL()
 	if err != nil {
 		t.Fatal(err)
@@ -127,6 +127,42 @@ func TestRefreshPreservesOmittedRefreshToken(t *testing.T) {
 	}
 	if tokens.AccessToken != "new-access" || tokens.RefreshToken != "existing-refresh" {
 		t.Fatalf("tokens=%+v", tokens)
+	}
+}
+
+func TestPublicClientExchangeAndRefreshOmitSecret(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Has("client_secret") {
+			t.Fatalf("public token form=%v", r.Form)
+		}
+		if r.Form.Get("grant_type") == "authorization_code" && r.Form.Get("code_verifier") != "fixture-verifier" {
+			t.Fatalf("public exchange form=%v", r.Form)
+		}
+		_, _ = w.Write([]byte(`{"access_token":"fixture-access"}`))
+	}))
+	defer server.Close()
+	config := fixtureConfig(server)
+	config.ClientAuthMode = browseroauth.ClientAuthModePublicPKCE
+	config.ClientSecret = "must-not-be-sent"
+	if _, err := config.Exchange(context.Background(), "fixture-code", "fixture-verifier"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Refresh(context.Background(), "fixture-refresh"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConfidentialClientRequiresSecret(t *testing.T) {
+	config := Config{
+		ClientID:       "fixture-client",
+		ClientAuthMode: ClientAuthModeClientSecretPost,
+		RedirectURI:    fixtureRedirectURI,
+	}
+	if _, err := config.AuthorizationURL(); err == nil || !strings.Contains(err.Error(), "client secret") {
+		t.Fatalf("missing secret error=%v", err)
 	}
 }
 
@@ -217,7 +253,7 @@ func TestDiscoverAccountReloadsIncompleteProjectMetadataWithoutFallback(t *testi
 }
 
 func TestOperationsValidateOnlyTheirConfiguration(t *testing.T) {
-	authorization, err := (Config{ClientID: "id", RedirectURI: fixtureRedirectURI, Endpoints: Endpoints{TokenURL: "relative"}}).AuthorizationURL()
+	authorization, err := (Config{ClientID: "id", ClientAuthMode: browseroauth.ClientAuthModePublicPKCE, RedirectURI: fixtureRedirectURI, Endpoints: Endpoints{TokenURL: "relative"}}).AuthorizationURL()
 	if err != nil || authorization.URL == "" {
 		t.Fatalf("authorization=%+v error=%v", authorization, err)
 	}
@@ -225,7 +261,7 @@ func TestOperationsValidateOnlyTheirConfiguration(t *testing.T) {
 		_, _ = w.Write([]byte(`{"access_token":"access"}`))
 	}))
 	defer server.Close()
-	if _, err := (Config{ClientID: "id", ClientSecret: "secret", Endpoints: Endpoints{TokenURL: server.URL}, HTTPClient: server.Client()}).Refresh(context.Background(), "refresh"); err != nil {
+	if _, err := (Config{ClientID: "id", ClientSecret: "secret", ClientAuthMode: browseroauth.ClientAuthModeClientSecretPost, Endpoints: Endpoints{TokenURL: server.URL}, HTTPClient: server.Client()}).Refresh(context.Background(), "refresh"); err != nil {
 		t.Fatalf("refresh required unrelated configuration: %v", err)
 	}
 	if _, err := (Config{Endpoints: Endpoints{LoadCodeAssistURL: server.URL}, HTTPClient: server.Client()}).DiscoverAccount(context.Background(), "access"); err != nil {
@@ -239,9 +275,10 @@ func TestAuthorizationValidationRejectsMissingCallerConfiguration(t *testing.T) 
 		config Config
 		want   string
 	}{
-		{name: "client ID", config: Config{ClientSecret: "secret", RedirectURI: fixtureRedirectURI}, want: "client ID"},
-		{name: "redirect URI", config: Config{ClientID: "id", ClientSecret: "secret", RedirectURI: "relative"}, want: "redirect URI"},
-		{name: "authorize endpoint", config: Config{ClientID: "id", ClientSecret: "secret", RedirectURI: fixtureRedirectURI, Endpoints: Endpoints{AuthorizeURL: "://bad"}}, want: "authorize URL"},
+		{name: "client ID", config: Config{ClientSecret: "secret", ClientAuthMode: browseroauth.ClientAuthModeClientSecretPost, RedirectURI: fixtureRedirectURI}, want: "client ID"},
+		{name: "redirect URI", config: Config{ClientID: "id", ClientSecret: "secret", ClientAuthMode: browseroauth.ClientAuthModeClientSecretPost, RedirectURI: "relative"}, want: "redirect URI"},
+		{name: "authorize endpoint", config: Config{ClientID: "id", ClientSecret: "secret", ClientAuthMode: browseroauth.ClientAuthModeClientSecretPost, RedirectURI: fixtureRedirectURI, Endpoints: Endpoints{AuthorizeURL: "://bad"}}, want: "authorize URL"},
+		{name: "client auth mode", config: Config{ClientID: "id", RedirectURI: fixtureRedirectURI}, want: "client auth mode"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -255,10 +292,11 @@ func TestAuthorizationValidationRejectsMissingCallerConfiguration(t *testing.T) 
 
 func TestDiscoverAccountRejectsMissingTokenAndMalformedEndpoint(t *testing.T) {
 	config := Config{
-		ClientID:     "fixture-client",
-		ClientSecret: "fixture-secret",
-		RedirectURI:  fixtureRedirectURI,
-		Endpoints:    Endpoints{LoadCodeAssistURL: "relative"},
+		ClientID:       "fixture-client",
+		ClientSecret:   "fixture-secret",
+		ClientAuthMode: browseroauth.ClientAuthModeClientSecretPost,
+		RedirectURI:    fixtureRedirectURI,
+		Endpoints:      Endpoints{LoadCodeAssistURL: "relative"},
 	}
 	if _, err := config.DiscoverAccount(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "access token") {
 		t.Fatalf("missing token error=%v", err)
@@ -353,9 +391,10 @@ func TestTokenEndpointErrorsRemainTypedAndRedacted(t *testing.T) {
 
 func fixtureConfig(server *httptest.Server) Config {
 	return Config{
-		ClientID:     "fixture-client",
-		ClientSecret: "fixture-secret",
-		RedirectURI:  fixtureRedirectURI,
+		ClientID:       "fixture-client",
+		ClientSecret:   "fixture-secret",
+		ClientAuthMode: browseroauth.ClientAuthModeClientSecretPost,
+		RedirectURI:    fixtureRedirectURI,
 		Endpoints: Endpoints{
 			AuthorizeURL:      server.URL + "/authorize",
 			TokenURL:          server.URL + "/token",

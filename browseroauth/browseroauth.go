@@ -27,14 +27,25 @@ const (
 	randomByteCount          = 32
 )
 
+// ClientAuthMode identifies how the OAuth client authenticates to the token
+// endpoint. The zero value is invalid so callers cannot silently omit a secret.
+type ClientAuthMode string
+
+const (
+	ClientAuthModePublicPKCE       ClientAuthMode = "public_pkce"
+	ClientAuthModeClientSecretPost ClientAuthMode = "client_secret_post"
+)
+
 // Config contains all provider- and application-specific OAuth configuration.
-// ExtraAuthParams are added only to authorization URLs; ExtraTokenParams are
-// added to both authorization-code and refresh token requests.
+// ClientAuthMode is required. ExtraAuthParams are added only to authorization
+// URLs; ExtraTokenParams are added to both authorization-code and refresh token
+// requests, except that client authentication fields are mode-controlled.
 type Config struct {
 	AuthorizeURL     string
 	TokenURL         string
 	ClientID         string
 	ClientSecret     string
+	ClientAuthMode   ClientAuthMode
 	Scopes           []string
 	ExtraAuthParams  url.Values
 	ExtraTokenParams url.Values
@@ -96,6 +107,9 @@ func (e *EndpointError) Error() string {
 // AuthorizationURL generates cryptographic state and a PKCE S256 verifier and
 // returns the provider authorization URL. The redirect URI is caller-owned.
 func (c Config) AuthorizationURL(redirectURI string) (Authorization, error) {
+	if err := c.validateClientAuth(); err != nil {
+		return Authorization{}, err
+	}
 	endpoint, err := validateURL("authorize URL", c.AuthorizeURL)
 	if err != nil {
 		return Authorization{}, err
@@ -107,16 +121,16 @@ func (c Config) AuthorizationURL(redirectURI string) (Authorization, error) {
 	if err != nil {
 		return Authorization{}, fmt.Errorf("generate OAuth state: %w", err)
 	}
-	verifier, err := randomValue()
-	if err != nil {
-		return Authorization{}, fmt.Errorf("generate PKCE verifier: %w", err)
-	}
-	digest := sha256.Sum256([]byte(verifier))
 	values := cloneValues(c.ExtraAuthParams)
 	values.Set("response_type", "code")
 	values.Set("client_id", strings.TrimSpace(c.ClientID))
 	values.Set("redirect_uri", strings.TrimSpace(redirectURI))
 	values.Set("state", state)
+	verifier, err := randomValue()
+	if err != nil {
+		return Authorization{}, fmt.Errorf("generate PKCE verifier: %w", err)
+	}
+	digest := sha256.Sum256([]byte(verifier))
 	values.Set("code_challenge", base64.RawURLEncoding.EncodeToString(digest[:]))
 	values.Set("code_challenge_method", "S256")
 	if len(c.Scopes) > 0 {
@@ -136,19 +150,25 @@ func (c Config) AuthorizationURL(redirectURI string) (Authorization, error) {
 // Exchange trades an authorization code for tokens using the supplied PKCE
 // verifier and caller-owned redirect URI.
 func (c Config) Exchange(ctx context.Context, code, codeVerifier, redirectURI string) (TokenEnvelope, error) {
+	if err := c.validateClientAuth(); err != nil {
+		return TokenEnvelope{}, err
+	}
 	if err := validateClientAndRedirect(c.ClientID, redirectURI); err != nil {
 		return TokenEnvelope{}, err
 	}
 	if strings.TrimSpace(code) == "" {
 		return TokenEnvelope{}, fmt.Errorf("authorization code is required")
 	}
-	if strings.TrimSpace(codeVerifier) == "" {
+	if c.ClientAuthMode == ClientAuthModePublicPKCE && strings.TrimSpace(codeVerifier) == "" {
 		return TokenEnvelope{}, fmt.Errorf("PKCE verifier is required")
 	}
 	form := cloneValues(c.ExtraTokenParams)
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", strings.TrimSpace(code))
-	form.Set("code_verifier", strings.TrimSpace(codeVerifier))
+	form.Del("code_verifier")
+	if strings.TrimSpace(codeVerifier) != "" {
+		form.Set("code_verifier", strings.TrimSpace(codeVerifier))
+	}
 	form.Set("redirect_uri", strings.TrimSpace(redirectURI))
 	return c.tokenRequest(ctx, form)
 }
@@ -156,6 +176,9 @@ func (c Config) Exchange(ctx context.Context, code, codeVerifier, redirectURI st
 // Refresh exchanges a refresh token. Providers may rotate refresh tokens; when
 // a successful response omits one, the input refresh token is preserved.
 func (c Config) Refresh(ctx context.Context, refreshToken string) (TokenEnvelope, error) {
+	if err := c.validateClientAuth(); err != nil {
+		return TokenEnvelope{}, err
+	}
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
 		return TokenEnvelope{}, fmt.Errorf("refresh token is required")
@@ -183,7 +206,8 @@ func (c Config) tokenRequest(ctx context.Context, form url.Values) (TokenEnvelop
 		return TokenEnvelope{}, fmt.Errorf("OAuth client ID is required")
 	}
 	form.Set("client_id", clientID)
-	if c.ClientSecret != "" {
+	form.Del("client_secret")
+	if c.ClientAuthMode == ClientAuthModeClientSecretPost {
 		form.Set("client_secret", c.ClientSecret)
 	}
 	requestContext, cancel := context.WithTimeout(ctx, defaultTimeout)
@@ -238,6 +262,20 @@ func (c Config) tokenRequest(ctx context.Context, form url.Values) (TokenEnvelop
 		tokens.Extra = nil
 	}
 	return tokens, nil
+}
+
+func (c Config) validateClientAuth() error {
+	switch c.ClientAuthMode {
+	case ClientAuthModePublicPKCE:
+		return nil
+	case ClientAuthModeClientSecretPost:
+		if strings.TrimSpace(c.ClientSecret) == "" {
+			return fmt.Errorf("OAuth client secret is required for client_secret_post")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported OAuth client auth mode %q", c.ClientAuthMode)
+	}
 }
 
 func (c Config) client() *http.Client {

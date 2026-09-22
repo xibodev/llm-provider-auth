@@ -38,14 +38,23 @@ type Endpoints struct {
 	LoadCodeAssistURL string
 }
 
+// ClientAuthMode identifies how the Antigravity OAuth client authenticates.
+type ClientAuthMode = browseroauth.ClientAuthMode
+
+const (
+	ClientAuthModePublicPKCE       = browseroauth.ClientAuthModePublicPKCE
+	ClientAuthModeClientSecretPost = browseroauth.ClientAuthModeClientSecretPost
+)
+
 // Config contains caller-owned OAuth application configuration. Each operation
 // validates only the fields it uses; values are never discovered implicitly.
 type Config struct {
-	ClientID     string
-	ClientSecret string
-	RedirectURI  string
-	Endpoints    Endpoints
-	HTTPClient   *http.Client
+	ClientID       string
+	ClientSecret   string
+	ClientAuthMode ClientAuthMode
+	RedirectURI    string
+	Endpoints      Endpoints
+	HTTPClient     *http.Client
 }
 
 // TokenEnvelope is the browseroauth token result returned by Exchange and
@@ -164,9 +173,11 @@ func (c Config) AuthorizationURL() (Authorization, error) {
 		return Authorization{}, err
 	}
 	oauth := browseroauth.Config{
-		AuthorizeURL: endpoints.AuthorizeURL,
-		ClientID:     strings.TrimSpace(c.ClientID),
-		Scopes:       Scopes(),
+		AuthorizeURL:   endpoints.AuthorizeURL,
+		ClientID:       strings.TrimSpace(c.ClientID),
+		ClientSecret:   c.ClientSecret,
+		ClientAuthMode: c.ClientAuthMode,
+		Scopes:         Scopes(),
 		ExtraAuthParams: url.Values{
 			"access_type": {"offline"},
 			"prompt":      {"consent"},
@@ -302,19 +313,17 @@ func (c Config) oauthConfig() (browseroauth.Config, error) {
 	if strings.TrimSpace(c.ClientID) == "" {
 		return browseroauth.Config{}, fmt.Errorf("Antigravity OAuth client ID is required")
 	}
-	if strings.TrimSpace(c.ClientSecret) == "" {
-		return browseroauth.Config{}, fmt.Errorf("Antigravity OAuth client secret is required")
-	}
 	endpoints := c.endpoints()
 	if _, err := absoluteURL("token URL", endpoints.TokenURL); err != nil {
 		return browseroauth.Config{}, err
 	}
 	return browseroauth.Config{
-		AuthorizeURL: endpoints.AuthorizeURL,
-		TokenURL:     endpoints.TokenURL,
-		ClientID:     strings.TrimSpace(c.ClientID),
-		ClientSecret: c.ClientSecret,
-		Scopes:       Scopes(),
+		AuthorizeURL:   endpoints.AuthorizeURL,
+		TokenURL:       endpoints.TokenURL,
+		ClientID:       strings.TrimSpace(c.ClientID),
+		ClientSecret:   c.ClientSecret,
+		ClientAuthMode: c.ClientAuthMode,
+		Scopes:         Scopes(),
 		ExtraAuthParams: url.Values{
 			"access_type": {"offline"},
 			"prompt":      {"consent"},

@@ -33,12 +33,18 @@ persist tokens. The caller owns those concerns and supplies the redirect URI,
 OAuth endpoints, client credentials, scopes, and any provider-specific
 authorization or token parameters.
 
+`browseroauth.Config.ClientAuthMode` is required. Use `public_pkce` for public
+clients, which require PKCE and never send a client secret, or
+`client_secret_post` for confidential clients, which require the secret and
+send it in token request bodies. Unknown and zero-valued modes are rejected.
+
 `antigravity` likewise performs no browser, listener, storage, UI, environment,
 or file operations. The caller supplies its Google OAuth client ID, client
-secret, and redirect URI. The package supplies canonical scopes and endpoints,
-requests offline consent, exchanges and refreshes tokens, and discovers only
-the Cloud Code Assist project returned by Google. `CompleteAuthorization`
-validates callback state before exchanging the authorization code.
+secret when required by its explicit client auth mode, and redirect URI. The
+package supplies canonical scopes and endpoints, requests offline consent,
+exchanges and refreshes tokens, and discovers only the Cloud Code Assist project
+returned by Google. `CompleteAuthorization` validates callback state before
+exchanging the authorization code.
 
 ## Quick Start
 

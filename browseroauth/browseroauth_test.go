@@ -17,6 +17,7 @@ func TestAuthorizationURLBuildsPKCES256AndState(t *testing.T) {
 	config := Config{
 		AuthorizeURL:    "https://auth.example.test/authorize?provider=fixture",
 		ClientID:        "fixture-client",
+		ClientAuthMode:  ClientAuthModePublicPKCE,
 		Scopes:          []string{"profile", "offline_access"},
 		ExtraAuthParams: url.Values{"audience": {"fixture-api"}, "response_type": {"overridden"}},
 	}
@@ -45,7 +46,7 @@ func TestAuthorizationURLBuildsPKCES256AndState(t *testing.T) {
 }
 
 func TestAuthorizationURLAcceptsCallerOwnedCustomRedirectScheme(t *testing.T) {
-	config := Config{AuthorizeURL: "https://auth.example.test/authorize", ClientID: "fixture-client"}
+	config := Config{AuthorizeURL: "https://auth.example.test/authorize", ClientID: "fixture-client", ClientAuthMode: ClientAuthModePublicPKCE}
 	authorization, err := config.AuthorizationURL("fixture-app:/oauth/callback")
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +65,7 @@ func TestExchangeUsesCallerConfigurationAndReturnsTypedEnvelope(t *testing.T) {
 		if err := r.ParseForm(); err != nil {
 			t.Fatal(err)
 		}
-		if r.Form.Get("grant_type") != "authorization_code" || r.Form.Get("client_id") != "fixture-client" || r.Form.Get("client_secret") != "fixture-secret" || r.Form.Get("code") != "fixture-code" || r.Form.Get("code_verifier") != "fixture-verifier" || r.Form.Get("redirect_uri") != "http://127.0.0.1/callback" || r.Form.Get("resource") != "fixture-resource" {
+		if r.Form.Get("grant_type") != "authorization_code" || r.Form.Get("client_id") != "fixture-client" || r.Form.Get("client_secret") != "fixture-secret" || r.Form.Get("code") != "fixture-code" || r.Form.Has("code_verifier") || r.Form.Get("redirect_uri") != "http://127.0.0.1/callback" || r.Form.Get("resource") != "fixture-resource" {
 			t.Fatalf("exchange form=%v", r.Form)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -76,10 +77,11 @@ func TestExchangeUsesCallerConfigurationAndReturnsTypedEnvelope(t *testing.T) {
 		TokenURL:         server.URL,
 		ClientID:         "fixture-client",
 		ClientSecret:     "fixture-secret",
+		ClientAuthMode:   ClientAuthModeClientSecretPost,
 		ExtraTokenParams: url.Values{"resource": {"fixture-resource"}, "client_id": {"must-be-overridden"}},
 		HTTPClient:       server.Client(),
 	}
-	tokens, err := config.Exchange(context.Background(), "fixture-code", "fixture-verifier", "http://127.0.0.1/callback")
+	tokens, err := config.Exchange(context.Background(), "fixture-code", "", "http://127.0.0.1/callback")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,19 +95,83 @@ func TestRefreshPreservesOmittedRefreshToken(t *testing.T) {
 		if err := r.ParseForm(); err != nil {
 			t.Fatal(err)
 		}
-		if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("refresh_token") != "existing-refresh" {
+		if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("refresh_token") != "existing-refresh" || r.Form.Has("client_secret") {
 			t.Fatalf("refresh form=%v", r.Form)
 		}
 		_, _ = w.Write([]byte(`{"access_token":"new-access","expires_in":"60"}`))
 	}))
 	defer server.Close()
-	config := Config{TokenURL: server.URL, ClientID: "fixture-client", HTTPClient: server.Client()}
+	config := Config{TokenURL: server.URL, ClientID: "fixture-client", ClientAuthMode: ClientAuthModePublicPKCE, HTTPClient: server.Client()}
 	tokens, err := config.Refresh(context.Background(), "existing-refresh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if tokens.AccessToken != "new-access" || tokens.RefreshToken != "existing-refresh" || tokens.ExpiresIn != 60 {
 		t.Fatalf("tokens=%+v", tokens)
+	}
+}
+
+func TestPublicExchangeRequiresVerifierAndNeverSendsSecret(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("code_verifier") != "fixture-verifier" || r.Form.Has("client_secret") {
+			t.Fatalf("public exchange form=%v", r.Form)
+		}
+		_, _ = w.Write([]byte(`{"access_token":"fixture-access"}`))
+	}))
+	defer server.Close()
+	config := Config{
+		TokenURL:         server.URL,
+		ClientID:         "fixture-client",
+		ClientSecret:     "must-not-be-sent",
+		ClientAuthMode:   ClientAuthModePublicPKCE,
+		ExtraTokenParams: url.Values{"client_secret": {"also-must-not-be-sent"}},
+		HTTPClient:       server.Client(),
+	}
+	if _, err := config.Exchange(context.Background(), "fixture-code", "", "http://127.0.0.1/callback"); err == nil || !strings.Contains(err.Error(), "PKCE verifier") {
+		t.Fatalf("missing verifier error=%v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("token endpoint called without verifier: requests=%d", requests)
+	}
+	if _, err := config.Exchange(context.Background(), "fixture-code", "fixture-verifier", "http://127.0.0.1/callback"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConfidentialRefreshRequiresAndSendsSecret(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("client_secret") != "fixture-secret" {
+			t.Fatalf("confidential refresh form=%v", r.Form)
+		}
+		_, _ = w.Write([]byte(`{"access_token":"fixture-access"}`))
+	}))
+	defer server.Close()
+	config := Config{TokenURL: server.URL, ClientID: "fixture-client", ClientAuthMode: ClientAuthModeClientSecretPost, HTTPClient: server.Client()}
+	if _, err := config.Refresh(context.Background(), "fixture-refresh"); err == nil || !strings.Contains(err.Error(), "client secret") {
+		t.Fatalf("missing secret error=%v", err)
+	}
+	config.ClientSecret = "fixture-secret"
+	if _, err := config.Refresh(context.Background(), "fixture-refresh"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientAuthModeFailsClosed(t *testing.T) {
+	for _, mode := range []ClientAuthMode{"", "unsupported"} {
+		t.Run(string(mode), func(t *testing.T) {
+			config := Config{AuthorizeURL: "https://auth.example.test/authorize", ClientID: "fixture-client", ClientAuthMode: mode}
+			if _, err := config.AuthorizationURL("http://127.0.0.1/callback"); err == nil || !strings.Contains(err.Error(), "client auth mode") {
+				t.Fatalf("mode=%q error=%v", mode, err)
+			}
+		})
 	}
 }
 
@@ -116,7 +182,7 @@ func TestTokenErrorsAreTypedSanitizedAndBounded(t *testing.T) {
 		_, _ = fmt.Fprintf(w, `{"error":"invalid_grant","error_description":"Bearer malicious owner@example.test api_key=%s %s"}`, secret, strings.Repeat("x", 700))
 	}))
 	defer server.Close()
-	config := Config{TokenURL: server.URL, ClientID: "fixture-client", HTTPClient: server.Client()}
+	config := Config{TokenURL: server.URL, ClientID: "fixture-client", ClientAuthMode: ClientAuthModePublicPKCE, HTTPClient: server.Client()}
 	_, err := config.Refresh(context.Background(), "fixture-refresh")
 	endpointErr := &EndpointError{}
 	if !errors.As(err, &endpointErr) || endpointErr.StatusCode != http.StatusUnauthorized || endpointErr.Code != "invalid_grant" || len([]rune(err.Error())) > maxDiagnosticChars || strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "owner@example.test") || strings.Contains(err.Error(), "malicious") {
@@ -129,7 +195,7 @@ func TestTokenResponseBodyIsBounded(t *testing.T) {
 		_, _ = w.Write([]byte(strings.Repeat("x", int(maxResponseBytes)+1)))
 	}))
 	defer server.Close()
-	config := Config{TokenURL: server.URL, ClientID: "fixture-client", HTTPClient: server.Client()}
+	config := Config{TokenURL: server.URL, ClientID: "fixture-client", ClientAuthMode: ClientAuthModePublicPKCE, HTTPClient: server.Client()}
 	_, err := config.Refresh(context.Background(), "fixture-refresh")
 	endpointErr := &EndpointError{}
 	if !errors.As(err, &endpointErr) || endpointErr.Code != "invalid_response" || !strings.Contains(endpointErr.Description, "exceeded") {
