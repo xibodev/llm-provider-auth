@@ -3,8 +3,9 @@
 //
 // A service account authenticates by signing a short-lived JWT assertion with
 // its RSA private key and exchanging that assertion for an access token, rather
-// than by presenting a static secret. The token lasts about an hour, so it is
-// cached per (account, key, scope) and refreshed shortly before it expires.
+// than by presenting a static secret. The token lasts about an hour, so a
+// TokenCache keeps it per (account, key, scope) and refreshes it shortly before
+// it expires. Each TokenCache owns its state; the package keeps none.
 //
 // This uses only the standard library: crypto/rsa and crypto/x509 sign the
 // assertion, so the gateway keeps its three-module dependency tree.

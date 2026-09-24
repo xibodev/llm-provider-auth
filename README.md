@@ -14,6 +14,9 @@ Each driver is an independent subpackage with zero unnecessary dependencies:
 - **`anthropic`**: Anthropic setup-token validation and request-header selection for setup tokens or API keys.
 - **`tokenstore`**: A storage contract and refresh coordinator that spend a rotating refresh token exactly once, even when several processes share one credential store. It includes an in-memory reference store and the `tokenstore/storetest` conformance suite.
 
+No package reads environment variables or runs an `init` function; callers
+supply all configuration explicitly. An architecture test enforces this.
+
 ## Installation
 
 ```bash
@@ -55,15 +58,17 @@ exchanging the authorization code.
 ```go
 import "github.com/xibodev/llm-provider-auth/gcp"
 
-// Parse service account JSON (from file or secret manager)
-cred, err := gcp.ParseCredential(keyJSON)
+// Parse a service account key read from a file or a secret manager.
+cred, err := gcp.Parse(keyJSON)
 if err != nil {
     log.Fatal(err)
 }
 
-// Mint OAuth2 access token with auto-refresh and memory cache
-token, err := gcp.TokenForCredential(ctx, cred, gcp.CloudPlatformScope)
-fmt.Println("Bearer:", token.AccessToken)
+// Keep one TokenCache for the process. It owns its cached tokens, HTTP client
+// and clock, and mints a new token shortly before the cached one expires.
+var tokens gcp.TokenCache
+token, err := tokens.AccessToken(cred, gcp.CloudPlatformScope)
+request.Header.Set("Authorization", "Bearer "+token)
 ```
 
 ### GitHub Copilot Device Code Flow & Session Exchange
@@ -71,17 +76,38 @@ fmt.Println("Bearer:", token.AccessToken)
 ```go
 import "github.com/xibodev/llm-provider-auth/copilot"
 
+client := copilot.New(copilot.Config{
+    CacheDir:   cacheDir, // empty disables the disk cache
+    UseGhCLI:   true,     // allow `gh auth token` as the last token source
+    AllowProxy: true,     // explicit opt-in; read copilot.TOSWarning first
+})
+
 // Start device login
-flow, err := copilot.StartDeviceFlow()
+flow, err := client.StartDeviceFlow()
 fmt.Printf("Visit %s and enter code: %s\n", flow.VerificationURI, flow.UserCode)
 
-// Poll until authorized
-result := copilot.PollDeviceFlowTokenOnce(flow.DeviceCode)
+// Poll every flow.Interval seconds until authorized
+result := client.PollDeviceFlowTokenOnce(flow.DeviceCode)
 if result.Status == "authorized" {
-    session, err := copilot.ResolveSession()
-    fmt.Println("Copilot Token:", session.Token)
+    session, err := client.GetSessionForOAuth(result.AccessToken, false)
+    // Send session.Token as a Bearer token to session.ChatBaseURL.
 }
 ```
+
+`copilot` reads no environment variables and keeps no process-wide state.
+Share one `Client` per configuration: it serializes concurrent polls of one
+device code. A product whose settings change at runtime uses
+`copilot.NewDynamic(func() copilot.Config { ... })`, and each operation reads
+one snapshot. Errors state only what went wrong; match `ErrProxyDisabled`,
+`ErrNoOAuthToken`, or `ErrOAuthTokenRejected` with `errors.Is` to add guidance
+that names your own settings.
+
+Earlier releases read `GITHUB_COPILOT_OAUTH_TOKEN`,
+`LLMGW_GITHUB_COPILOT_OAUTH_TOKEN`, `LLMGW_GITHUB_COPILOT_CACHE_DIR`, and
+`LLMGW_EXPERIMENTAL_COPILOT_PROVIDER`, defaulted the cache to
+`~/.llmgw/cache`, and enabled the gh CLI. A product that relied on that behavior
+maps those values onto `Config.OAuthToken`, `Config.CacheDir`,
+`Config.AllowProxy`, and `Config.UseGhCLI` itself.
 
 ## Refresh-safe credential storage
 

@@ -50,24 +50,49 @@ func tokenError(status int, code, description string) *TokenError {
 	}
 }
 
-// tokenCache holds minted access tokens keyed by credential fingerprint. Tokens
-// are short lived and re-mintable, so this is memory only: a restart costs one
-// extra exchange, while persisting them would put bearer tokens on disk.
-var tokenCache = struct {
-	sync.Mutex
+// defaultExchangeTimeout bounds a token exchange when TokenCache.HTTPClient is
+// nil.
+const defaultExchangeTimeout = 30 * time.Second
+
+// TokenCache mints access tokens for service-account credentials and caches
+// them per credential and scope until shortly before they expire.
+//
+// Each TokenCache owns its tokens, HTTP client and clock, so separate caches
+// share nothing. Tokens are short lived and re-mintable, so they are held in
+// memory only: a restart costs one extra exchange, while persisting them would
+// put bearer tokens on disk.
+//
+// The zero value is ready to use and a TokenCache is safe for concurrent use.
+// Set its fields before first use, and do not copy it afterwards.
+type TokenCache struct {
+	// HTTPClient performs the token exchange. Nil uses a client that times out
+	// after 30 seconds.
+	HTTPClient *http.Client
+	// Now returns the current time. Nil uses time.Now.
+	Now func() time.Time
+
+	mu      sync.Mutex
 	entries map[string]cachedToken
-}{entries: map[string]cachedToken{}}
+}
 
 type cachedToken struct {
 	token     string
 	expiresAt time.Time
 }
 
-// now is indirected so tests can drive expiry without sleeping.
-var now = time.Now
+func (t *TokenCache) now() time.Time {
+	if t.Now != nil {
+		return t.Now()
+	}
+	return time.Now()
+}
 
-// httpClient is indirected so tests can assert on the exchange request.
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+func (t *TokenCache) client() *http.Client {
+	if t.HTTPClient != nil {
+		return t.HTTPClient
+	}
+	return &http.Client{Timeout: defaultExchangeTimeout}
+}
 
 // fingerprint identifies a credential and scope without retaining anything
 // secret: the key id and client email are metadata, and hashing keeps the cache
@@ -78,8 +103,9 @@ func fingerprint(c *Credential, scope string) string {
 }
 
 // AccessToken returns a cached token for the credential and scope, minting a
-// new one when none is cached or the cached one is close to expiry.
-func AccessToken(c *Credential, scope string) (string, error) {
+// new one when none is cached or the cached one is close to expiry. An empty
+// scope means CloudPlatformScope.
+func (t *TokenCache) AccessToken(c *Credential, scope string) (string, error) {
 	if c == nil {
 		return "", fmt.Errorf("service account credential is not configured")
 	}
@@ -88,34 +114,37 @@ func AccessToken(c *Credential, scope string) (string, error) {
 	}
 	key := fingerprint(c, scope)
 
-	tokenCache.Lock()
-	entry, ok := tokenCache.entries[key]
-	tokenCache.Unlock()
-	if ok && now().Add(refreshBeforeExpiry).Before(entry.expiresAt) {
+	t.mu.Lock()
+	entry, ok := t.entries[key]
+	t.mu.Unlock()
+	if ok && t.now().Add(refreshBeforeExpiry).Before(entry.expiresAt) {
 		return entry.token, nil
 	}
 
-	token, expiresAt, err := exchange(c, scope)
+	token, expiresAt, err := t.exchange(c, scope)
 	if err != nil {
 		return "", err
 	}
-	tokenCache.Lock()
-	tokenCache.entries[key] = cachedToken{token: token, expiresAt: expiresAt}
-	tokenCache.Unlock()
+	t.mu.Lock()
+	if t.entries == nil {
+		t.entries = map[string]cachedToken{}
+	}
+	t.entries[key] = cachedToken{token: token, expiresAt: expiresAt}
+	t.mu.Unlock()
 	return token, nil
 }
 
-// ResetCache drops every cached token. Used by tests and after a credential is
-// revoked or replaced.
-func ResetCache() {
-	tokenCache.Lock()
-	tokenCache.entries = map[string]cachedToken{}
-	tokenCache.Unlock()
+// Reset drops every cached token, for example after a credential is revoked or
+// replaced.
+func (t *TokenCache) Reset() {
+	t.mu.Lock()
+	t.entries = nil
+	t.mu.Unlock()
 }
 
 // signAssertion builds the RS256 JWT that Google exchanges for a token.
-func signAssertion(c *Credential, scope string) (string, error) {
-	issued := now().UTC()
+func signAssertion(c *Credential, scope string, issued time.Time) (string, error) {
+	issued = issued.UTC()
 	header := map[string]string{"alg": "RS256", "typ": "JWT"}
 	if c.privateKeyID != "" {
 		header["kid"] = c.privateKeyID
@@ -153,8 +182,8 @@ type tokenResponse struct {
 }
 
 // exchange trades the signed assertion for an access token.
-func exchange(c *Credential, scope string) (string, time.Time, error) {
-	assertion, err := signAssertion(c, scope)
+func (t *TokenCache) exchange(c *Credential, scope string) (string, time.Time, error) {
+	assertion, err := signAssertion(c, scope, t.now())
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -167,7 +196,7 @@ func exchange(c *Credential, scope string) (string, time.Time, error) {
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	response, err := httpClient.Do(request)
+	response, err := t.client().Do(request)
 	if err != nil {
 		return "", time.Time{}, tokenError(0, "transport", err.Error())
 	}
@@ -190,5 +219,5 @@ func exchange(c *Credential, scope string) (string, time.Time, error) {
 	if lifetime <= 0 {
 		lifetime = int64(assertionTTL / time.Second)
 	}
-	return parsed.AccessToken, now().Add(time.Duration(lifetime) * time.Second), nil
+	return parsed.AccessToken, t.now().Add(time.Duration(lifetime) * time.Second), nil
 }
