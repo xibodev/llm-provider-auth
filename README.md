@@ -12,6 +12,7 @@ Each driver is an independent subpackage with zero unnecessary dependencies:
 - **`browseroauth`**: Storage-neutral browser OAuth primitives with caller-supplied endpoints and client configuration, PKCE S256, state generation, code exchange, and refresh.
 - **`antigravity`**: Storage-neutral Google Antigravity OAuth flow and typed Cloud Code Assist account/project discovery, built on `browseroauth`.
 - **`anthropic`**: Anthropic setup-token validation and request-header selection for setup tokens or API keys.
+- **`tokenstore`**: A storage contract and refresh coordinator that spend a rotating refresh token exactly once, even when several processes share one credential store. It includes an in-memory reference store and the `tokenstore/storetest` conformance suite.
 
 ## Installation
 
@@ -26,6 +27,7 @@ go get github.com/xibodev/llm-provider-auth/codex
 go get github.com/xibodev/llm-provider-auth/browseroauth
 go get github.com/xibodev/llm-provider-auth/antigravity
 go get github.com/xibodev/llm-provider-auth/anthropic
+go get github.com/xibodev/llm-provider-auth/tokenstore
 ```
 
 `browseroauth` deliberately does not open a browser, run a callback listener, or
@@ -78,6 +80,66 @@ result := copilot.PollDeviceFlowTokenOnce(flow.DeviceCode)
 if result.Status == "authorized" {
     session, err := copilot.ResolveSession()
     fmt.Println("Copilot Token:", session.Token)
+}
+```
+
+## Refresh-safe credential storage
+
+Providers such as OpenAI rotate refresh tokens and detect reuse: presenting an
+old refresh token can revoke the whole grant. `tokenstore` prevents two
+goroutines or processes from spending the same refresh token.
+
+A store implements `tokenstore.Store`:
+
+- `Load`, `Save`, `ReplaceIfCurrent`, and `RevokeIfCurrent`, with an opaque
+  revision assigned on every write. Conditional writes return `ErrConflict`
+  when the revision moved.
+- A required `Lease(ctx, key)`. The lease must be exclusive across every
+  process sharing the store. File-backed stores should hold an OS advisory
+  lock on a separate lock file, because a data file rewritten by
+  temp-file-and-rename loses any lock held on it.
+
+`tokenstore.Coordinator` combines the two guarantees:
+
+```go
+coordinator, err := tokenstore.NewCoordinator(store, func(ctx context.Context, current tokenstore.Record) (tokenstore.Record, error) {
+    tokens, err := codex.Refresh(clientID, current.RefreshToken)
+    if err != nil {
+        return tokenstore.Record{}, err // *codex.RefreshError reports terminal grants
+    }
+    refreshed := tokenstore.Record{
+        AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken,
+        IDToken: tokens.IDToken, TokenType: tokens.TokenType, AccountID: tokens.AccountID,
+    }
+    if tokens.ExpiresAt > 0 {
+        refreshed.Expiry = time.Unix(tokens.ExpiresAt, 0)
+    }
+    return refreshed, nil
+})
+
+record, err := coordinator.Token(ctx, "openai")        // refreshes near expiry
+record, err = coordinator.Rejected(ctx, "openai", record) // after an upstream 401
+```
+
+The coordinator provides these guarantees:
+
+- It refreshes under the lease, then re-reads, so a waiter uses a refresh that
+  another holder already completed.
+- It never lets a refresh change the bound `AccountID`.
+- It revokes the credential when the provider rejects the grant permanently.
+  `IsTerminal` classifies the refresh error.
+- It never overwrites a login that lands during a refresh.
+- It keeps token material out of errors and out of `Record`'s `String`,
+  `GoString`, and `slog` output.
+
+Every store implementation should run the conformance suite:
+
+```go
+func TestConformance(t *testing.T) {
+    storetest.Run(t, func(t *testing.T) storetest.Opener {
+        path := filepath.Join(t.TempDir(), "auth.json")
+        return func(t *testing.T) tokenstore.Store { return mystore.Open(path) }
+    })
 }
 ```
 
