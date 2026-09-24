@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/xibodev/llm-provider-auth/internal/sanitize"
+	"github.com/xibodev/llm-provider-auth/tokenstore"
 )
 
 const maxAuthDiagnosticChars = 512
@@ -85,6 +86,13 @@ func authError(operation string, status int, code, description string) *AuthErro
 		Code:        sanitize.SanitizeTextLimit(strings.TrimSpace(code), maxAuthDiagnosticChars),
 		Description: sanitize.SanitizeTextLimit(strings.TrimSpace(description), maxAuthDiagnosticChars),
 	}
+}
+
+// Terminal reports whether the token endpoint rejected the refresh grant
+// permanently, so a tokenstore.Coordinator revokes the credential instead of
+// retrying it.
+func (e *RefreshError) Terminal() bool {
+	return e != nil && tokenstore.TerminalOAuthCode(e.Code)
 }
 
 func (e *RefreshError) Error() string {

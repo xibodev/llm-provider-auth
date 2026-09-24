@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/xibodev/llm-provider-auth/internal/sanitize"
+	"github.com/xibodev/llm-provider-auth/tokenstore"
 )
 
 const (
@@ -88,6 +89,13 @@ func ValidateState(expected, actual string) error {
 		return fmt.Errorf("OAuth state mismatch")
 	}
 	return nil
+}
+
+// Terminal reports whether the token endpoint rejected a refresh grant
+// permanently, so a tokenstore.Coordinator revokes the credential instead of
+// retrying it. Transport and response-format failures are not terminal.
+func (e *EndpointError) Terminal() bool {
+	return e != nil && tokenstore.TerminalOAuthCode(e.Code)
 }
 
 func (e *EndpointError) Error() string {
