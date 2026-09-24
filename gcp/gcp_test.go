@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -51,6 +52,29 @@ func testKeyJSON(t *testing.T, tokenURI string) (string, *rsa.PrivateKey) {
 	return string(raw), key
 }
 
+func testCredential(t *testing.T, tokenURI string) *Credential {
+	t.Helper()
+	raw, _ := testKeyJSON(t, tokenURI)
+	cred, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	return cred
+}
+
+// countingTokenServer answers every exchange with a fresh-looking token and
+// counts how many exchanges it served.
+func countingTokenServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	calls := new(atomic.Int32)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"access_token":"ya29.test-token","expires_in":3600}`))
+	}))
+	t.Cleanup(server.Close)
+	return server, calls
+}
+
 // verifyRS256 checks the assertion signature the way Google's endpoint would.
 func verifyRS256(signingInput, signature string, pub *rsa.PublicKey) error {
 	raw, err := base64.RawURLEncoding.DecodeString(signature)
@@ -62,6 +86,7 @@ func verifyRS256(signingInput, signature string, pub *rsa.PublicKey) error {
 }
 
 func TestParseAcceptsServiceAccountKey(t *testing.T) {
+	t.Parallel()
 	raw, _ := testKeyJSON(t, "")
 	cred, err := Parse([]byte(raw))
 	if err != nil {
@@ -84,6 +109,7 @@ func TestParseAcceptsServiceAccountKey(t *testing.T) {
 }
 
 func TestParseRejectsNonServiceAccountShapes(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		"authorized user": `{"type":"authorized_user","client_id":"x"}`,
 		"missing type":    `{"project_id":"p"}`,
@@ -92,6 +118,7 @@ func TestParseRejectsNonServiceAccountShapes(t *testing.T) {
 	}
 	for name, raw := range cases {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			if _, err := Parse([]byte(raw)); err == nil {
 				t.Fatalf("expected an error for %s", name)
 			}
@@ -100,6 +127,7 @@ func TestParseRejectsNonServiceAccountShapes(t *testing.T) {
 }
 
 func TestParseReportsEveryMissingField(t *testing.T) {
+	t.Parallel()
 	_, pemText := newTestKey(t)
 	raw := fmt.Sprintf(`{"type":"service_account","private_key":%q}`, pemText)
 	_, err := Parse([]byte(raw))
@@ -117,6 +145,7 @@ func TestParseReportsEveryMissingField(t *testing.T) {
 // TestParseErrorsNeverLeakKeyMaterial guards the invariant that key bytes must
 // never reach a log line or an API error.
 func TestParseErrorsNeverLeakKeyMaterial(t *testing.T) {
+	t.Parallel()
 	_, pemText := newTestKey(t)
 	raw := fmt.Sprintf(`{"type":"authorized_user","private_key":%q}`, pemText)
 	_, err := Parse([]byte(raw))
@@ -132,12 +161,12 @@ func TestParseErrorsNeverLeakKeyMaterial(t *testing.T) {
 }
 
 // tokenServer stands in for oauth2.googleapis.com and captures the assertion.
-func tokenServer(t *testing.T, status int) (*httptest.Server, *string) {
+func tokenServer(t *testing.T, status int) (*httptest.Server, *atomic.Value) {
 	t.Helper()
-	captured := new(string)
+	captured := new(atomic.Value)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		*captured = r.Form.Get("assertion")
+		captured.Store(r.Form.Get("assertion"))
 		if got := r.Form.Get("grant_type"); got != jwtGrantType {
 			t.Errorf("grant_type = %q", got)
 		}
@@ -154,7 +183,7 @@ func tokenServer(t *testing.T, status int) (*httptest.Server, *string) {
 }
 
 func TestAccessTokenMintsAVerifiableAssertion(t *testing.T) {
-	ResetCache()
+	t.Parallel()
 	server, captured := tokenServer(t, http.StatusOK)
 	raw, key := testKeyJSON(t, server.URL)
 	cred, err := Parse([]byte(raw))
@@ -162,7 +191,7 @@ func TestAccessTokenMintsAVerifiableAssertion(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 
-	token, err := AccessToken(cred, CloudPlatformScope)
+	token, err := (&TokenCache{}).AccessToken(cred, CloudPlatformScope)
 	if err != nil {
 		t.Fatalf("AccessToken: %v", err)
 	}
@@ -170,7 +199,8 @@ func TestAccessTokenMintsAVerifiableAssertion(t *testing.T) {
 		t.Fatalf("token = %q", token)
 	}
 
-	parts := strings.Split(*captured, ".")
+	assertion, _ := captured.Load().(string)
+	parts := strings.Split(assertion, ".")
 	if len(parts) != 3 {
 		t.Fatalf("assertion has %d segments, want 3", len(parts))
 	}
@@ -201,51 +231,38 @@ func TestAccessTokenMintsAVerifiableAssertion(t *testing.T) {
 }
 
 func TestAccessTokenCachesUntilCloseToExpiry(t *testing.T) {
-	ResetCache()
-	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		_, _ = w.Write([]byte(`{"access_token":"ya29.test-token","expires_in":3600}`))
-	}))
-	defer server.Close()
-	raw, _ := testKeyJSON(t, server.URL)
-	cred, err := Parse([]byte(raw))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
+	t.Parallel()
+	server, calls := countingTokenServer(t)
+	cred := testCredential(t, server.URL)
 
 	base := time.Now()
-	now = func() time.Time { return base }
-	defer func() { now = time.Now }()
+	current := base
+	cache := &TokenCache{Now: func() time.Time { return current }}
 
 	for i := 0; i < 3; i++ {
-		if _, err := AccessToken(cred, CloudPlatformScope); err != nil {
+		if _, err := cache.AccessToken(cred, CloudPlatformScope); err != nil {
 			t.Fatalf("AccessToken: %v", err)
 		}
 	}
-	if calls != 1 {
-		t.Fatalf("minted %d times, want 1 (later calls should hit the cache)", calls)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("minted %d times, want 1 (later calls should hit the cache)", got)
 	}
 
 	// Inside the refresh window the token must be re-minted, not served.
-	now = func() time.Time { return base.Add(3600*time.Second - 30*time.Second) }
-	if _, err := AccessToken(cred, CloudPlatformScope); err != nil {
+	current = base.Add(3600*time.Second - 30*time.Second)
+	if _, err := cache.AccessToken(cred, CloudPlatformScope); err != nil {
 		t.Fatalf("AccessToken: %v", err)
 	}
-	if calls != 2 {
-		t.Fatalf("minted %d times, want 2 (early refresh)", calls)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("minted %d times, want 2 (early refresh)", got)
 	}
 }
 
 func TestAccessTokenSurfacesExchangeFailure(t *testing.T) {
-	ResetCache()
+	t.Parallel()
 	server, _ := tokenServer(t, http.StatusBadRequest)
-	raw, _ := testKeyJSON(t, server.URL)
-	cred, err := Parse([]byte(raw))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if _, err := AccessToken(cred, CloudPlatformScope); err == nil {
+	cred := testCredential(t, server.URL)
+	if _, err := (&TokenCache{}).AccessToken(cred, CloudPlatformScope); err == nil {
 		t.Fatal("expected an error")
 	} else if !strings.Contains(err.Error(), "Invalid JWT Signature") {
 		t.Fatalf("error should carry Google's reason, got: %v", err)
@@ -253,19 +270,15 @@ func TestAccessTokenSurfacesExchangeFailure(t *testing.T) {
 }
 
 func TestAccessTokenSanitizesSyntheticEndpointDiagnostics(t *testing.T) {
-	ResetCache()
+	t.Parallel()
 	secret := "llmgw_" + strings.Repeat("a", 32)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = fmt.Fprintf(w, `{"error":"invalid_grant","error_description":"Bearer malicious-bearer owner@example.test api_key=%s %s"}`, secret, strings.Repeat("z", 700))
 	}))
 	defer server.Close()
-	raw, _ := testKeyJSON(t, server.URL)
-	cred, err := Parse([]byte(raw))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = AccessToken(cred, CloudPlatformScope)
+	cred := testCredential(t, server.URL)
+	_, err := (&TokenCache{}).AccessToken(cred, CloudPlatformScope)
 	tokenErr := &TokenError{}
 	if !errors.As(err, &tokenErr) || tokenErr.StatusCode != http.StatusUnauthorized || tokenErr.Code != "invalid_grant" {
 		t.Fatalf("error=%v tokenError=%+v", err, tokenErr)
@@ -280,18 +293,12 @@ type syntheticRoundTripper func(*http.Request) (*http.Response, error)
 func (f syntheticRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestAccessTokenSanitizesSyntheticTransportURL(t *testing.T) {
-	ResetCache()
-	oldClient := httpClient
-	httpClient = &http.Client{Transport: syntheticRoundTripper(func(r *http.Request) (*http.Response, error) {
+	t.Parallel()
+	cache := &TokenCache{HTTPClient: &http.Client{Transport: syntheticRoundTripper(func(r *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("dial %s?access_token=query-secret for owner@example.test", r.URL)
-	})}
-	t.Cleanup(func() { httpClient = oldClient })
-	raw, _ := testKeyJSON(t, "https://tokens.example.test/exchange")
-	cred, err := Parse([]byte(raw))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = AccessToken(cred, CloudPlatformScope)
+	})}}
+	cred := testCredential(t, "https://tokens.example.test/exchange")
+	_, err := cache.AccessToken(cred, CloudPlatformScope)
 	tokenErr := &TokenError{}
 	if !errors.As(err, &tokenErr) || tokenErr.Code != "transport" || strings.Contains(err.Error(), "query-secret") || strings.Contains(err.Error(), "owner@example.test") {
 		t.Fatalf("unsafe transport error: %v", err)
@@ -299,6 +306,7 @@ func TestAccessTokenSanitizesSyntheticTransportURL(t *testing.T) {
 }
 
 func TestTokenErrorFinalMessageIsSanitizedAndBounded(t *testing.T) {
+	t.Parallel()
 	secret := "llmgw_" + strings.Repeat("e", 32)
 	err := &TokenError{
 		StatusCode:  http.StatusBadGateway,
@@ -312,26 +320,57 @@ func TestTokenErrorFinalMessageIsSanitizedAndBounded(t *testing.T) {
 }
 
 func TestScopesAreCachedSeparately(t *testing.T) {
-	ResetCache()
-	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		_, _ = w.Write([]byte(`{"access_token":"ya29.test-token","expires_in":3600}`))
-	}))
-	defer server.Close()
-	raw, _ := testKeyJSON(t, server.URL)
-	cred, err := Parse([]byte(raw))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
+	t.Parallel()
+	server, calls := countingTokenServer(t)
+	cred := testCredential(t, server.URL)
+	cache := &TokenCache{}
+
+	if _, err := cache.AccessToken(cred, CloudPlatformScope); err != nil {
+		t.Fatalf("AccessToken: %v", err)
+	}
+	if _, err := cache.AccessToken(cred, "https://www.googleapis.com/auth/devstorage.read_only"); err != nil {
+		t.Fatalf("AccessToken: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("minted %d times, want 2 (one per scope)", got)
+	}
+}
+
+// TestTokenCachesShareNothing pins the per-instance ownership: one cache never
+// serves another cache's token, and resetting one leaves the other intact.
+func TestTokenCachesShareNothing(t *testing.T) {
+	t.Parallel()
+	server, calls := countingTokenServer(t)
+	cred := testCredential(t, server.URL)
+	first, second := &TokenCache{}, &TokenCache{}
+
+	for _, cache := range []*TokenCache{first, second, first, second} {
+		if _, err := cache.AccessToken(cred, CloudPlatformScope); err != nil {
+			t.Fatalf("AccessToken: %v", err)
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("minted %d times, want 2 (one per cache)", got)
 	}
 
-	if _, err := AccessToken(cred, CloudPlatformScope); err != nil {
+	first.Reset()
+	if _, err := second.AccessToken(cred, CloudPlatformScope); err != nil {
 		t.Fatalf("AccessToken: %v", err)
 	}
-	if _, err := AccessToken(cred, "https://www.googleapis.com/auth/devstorage.read_only"); err != nil {
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("minted %d times, want 2 (reset must not reach another cache)", got)
+	}
+	if _, err := first.AccessToken(cred, CloudPlatformScope); err != nil {
 		t.Fatalf("AccessToken: %v", err)
 	}
-	if calls != 2 {
-		t.Fatalf("minted %d times, want 2 (one per scope)", calls)
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("minted %d times, want 3 (reset cache re-mints)", got)
+	}
+}
+
+func TestAccessTokenRejectsMissingCredential(t *testing.T) {
+	t.Parallel()
+	if _, err := (&TokenCache{}).AccessToken(nil, CloudPlatformScope); err == nil {
+		t.Fatal("expected an error for a nil credential")
 	}
 }

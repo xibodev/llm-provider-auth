@@ -1,9 +1,16 @@
+// Package copilot resolves GitHub OAuth tokens for GitHub Copilot, runs the
+// GitHub device flow, and exchanges OAuth tokens for Copilot session tokens.
+//
+// The package reads no environment variables and keeps no process-wide state.
+// The caller supplies a Config, and each Client owns what it caches, so a
+// product that honours environment variables maps them onto Config itself.
 package copilot
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -20,6 +27,20 @@ import (
 const (
 	ClientID = "Iv1.b507a08c87ecfe98"
 
+	// Canonical GitHub endpoints. Config.Endpoints replaces them for tests and
+	// compatible deployments.
+	DeviceCodeURL   = "https://github.com/login/device/code"
+	AccessTokenURL  = "https://github.com/login/oauth/access_token"
+	SessionTokenURL = "https://api.github.com/copilot_internal/v2/token"
+
+	// DefaultEditorVersion and DefaultEditorPluginVersion identify the client
+	// during the session-token exchange unless Config overrides them.
+	DefaultEditorVersion       = "vscode/1.96.2"
+	DefaultEditorPluginVersion = "copilot-auth/1.0"
+
+	// DefaultTimeout bounds each request when Config.HTTPClient is nil.
+	DefaultTimeout = 60 * time.Second
+
 	defaultChatBase        = "https://api.githubcopilot.com"
 	oauthCacheFile         = "github_copilot_oauth.json"
 	sessionCacheFile       = "github_copilot_session.json"
@@ -32,38 +53,33 @@ const (
 		"expect the upstream endpoint/headers to change without notice."
 )
 
-// Endpoint variables keep device and session flows testable against local mocked endpoints.
-// Production defaults remain the official GitHub endpoints.
+// Error kinds matched with errors.Is. AuthError messages state only what went
+// wrong; a product matches the kind to add guidance that names its own
+// settings and sign-in surfaces.
 var (
-	DeviceCodeURL   = "https://github.com/login/device/code"
-	AccessTokenURL  = "https://github.com/login/oauth/access_token"
-	SessionTokenURL = "https://api.github.com/copilot_internal/v2/token"
-	devicePollLocks sync.Map
+	// ErrProxyDisabled reports that Config.AllowProxy is false.
+	ErrProxyDisabled = errors.New("copilot: provider use is not enabled")
+	// ErrNoOAuthToken reports that no configured source produced an OAuth token.
+	ErrNoOAuthToken = errors.New("copilot: no OAuth token available")
+	// ErrOAuthTokenRejected reports that GitHub refused the OAuth token during
+	// the session-token exchange: it is invalid or lacks Copilot access.
+	ErrOAuthTokenRejected = errors.New("copilot: OAuth token rejected")
 )
 
-var (
-	CacheDir            = ""
-	OAuthToken          = ""
-	UseGhCLI            = true
-	EditorVersion       = "vscode/1.96.2"
-	EditorPluginVersion = "copilot-auth/1.0"
-	TimeoutSeconds      = 60.0
-	AllowProxy          = true
-
-	CacheDirFunc   func() string
-	OAuthTokenFunc func() string
-	UseGhCLIFunc   func() bool
-	AllowProxyFunc func() bool
-)
-
-// AuthError is raised when no usable Copilot OAuth token can be resolved.
+// AuthError reports a Copilot authentication failure. Msg is sanitized and safe
+// to show.
 type AuthError struct {
 	Msg        string
 	StatusCode int
 	Transport  bool
+	// Err is ErrProxyDisabled, ErrNoOAuthToken, ErrOAuthTokenRejected, or nil.
+	Err error
 }
 
 func (e *AuthError) Error() string { return e.Msg }
+
+// Unwrap exposes the error kind to errors.Is.
+func (e *AuthError) Unwrap() error { return e.Err }
 
 func newAuthError(status int, message string) *AuthError {
 	return &AuthError{Msg: sanitize.SanitizeTextLimit(message, maxAuthDiagnosticChars), StatusCode: status}
@@ -76,42 +92,100 @@ type Session struct {
 	ExpiresAt   int64
 }
 
-func httpClient() *http.Client {
-	timeout := TimeoutSeconds
-	if timeout <= 0 {
-		timeout = 60
+// Endpoints allows tests and compatible deployments to replace GitHub URLs.
+// Empty fields use the canonical GitHub endpoints.
+type Endpoints struct {
+	DeviceCodeURL   string
+	AccessTokenURL  string
+	SessionTokenURL string
+}
+
+// Config contains caller-owned Copilot configuration. Values are never
+// discovered implicitly.
+type Config struct {
+	// CacheDir holds the persisted OAuth token and session tokens. Empty
+	// disables the disk cache: nothing is read from or written to disk, so
+	// every session request performs an exchange.
+	CacheDir string
+	// OAuthToken is an operator-supplied GitHub OAuth token. It takes
+	// precedence over the cached token and the gh CLI.
+	OAuthToken string
+	// UseGhCLI lets `gh auth token` supply the OAuth token when neither
+	// OAuthToken nor the cache does.
+	UseGhCLI bool
+	// AllowProxy is the product's explicit opt-in to Copilot use; see
+	// TOSWarning. AssertProxyAllowed fails without it.
+	AllowProxy bool
+	Endpoints  Endpoints
+	// HTTPClient performs every request. Nil uses a client that times out
+	// after DefaultTimeout.
+	HTTPClient *http.Client
+	// EditorVersion and EditorPluginVersion identify the client during the
+	// session-token exchange. Empty fields use the package defaults.
+	EditorVersion       string
+	EditorPluginVersion string
+}
+
+// Client performs Copilot authentication with caller-owned configuration. It is
+// safe for concurrent use. Share one Client per configuration, because it
+// serializes concurrent polls of one device code as GitHub requires.
+type Client struct {
+	settings func() Config
+	polls    sync.Map // device code -> *sync.Mutex
+}
+
+// New returns a Client with fixed configuration.
+func New(config Config) *Client {
+	return &Client{settings: func() Config { return config }}
+}
+
+// NewDynamic returns a Client that reads its configuration at the start of
+// every operation, for products whose settings change at runtime. One
+// operation always works from one snapshot.
+func NewDynamic(settings func() Config) *Client {
+	if settings == nil {
+		settings = func() Config { return Config{} }
 	}
-	return &http.Client{Timeout: time.Duration(timeout * float64(time.Second))}
+	return &Client{settings: settings}
+}
+
+func (c Config) endpoints() Endpoints {
+	result := c.Endpoints
+	if strings.TrimSpace(result.DeviceCodeURL) == "" {
+		result.DeviceCodeURL = DeviceCodeURL
+	}
+	if strings.TrimSpace(result.AccessTokenURL) == "" {
+		result.AccessTokenURL = AccessTokenURL
+	}
+	if strings.TrimSpace(result.SessionTokenURL) == "" {
+		result.SessionTokenURL = SessionTokenURL
+	}
+	return result
+}
+
+func (c Config) client() *http.Client {
+	if c.HTTPClient != nil {
+		return c.HTTPClient
+	}
+	return &http.Client{Timeout: DefaultTimeout}
 }
 
 // ---- cache paths -------------------------------------------------------- //
 
-func cacheDir() string {
-	if CacheDirFunc != nil {
-		if d := CacheDirFunc(); d != "" {
-			return d
-		}
+// cachePath returns the path of name inside CacheDir, or "" when the disk cache
+// is disabled. Every reader and writer treats "" as "no cache" so a missing
+// directory can never resolve against the working directory.
+func (c Config) cachePath(name string) string {
+	if c.CacheDir == "" {
+		return ""
 	}
-	if CacheDir != "" {
-		return CacheDir
-	}
-	if o := strings.TrimSpace(os.Getenv("LLMGW_GITHUB_COPILOT_CACHE_DIR")); o != "" {
-		return o
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".llmgw", "cache")
+	return filepath.Join(c.CacheDir, name)
 }
 
-func ensureCacheDir() string {
-	d := cacheDir()
-	_ = os.MkdirAll(d, 0o755)
-	return d
-}
-
-func oauthCachePath() string   { return filepath.Join(cacheDir(), oauthCacheFile) }
-func sessionCachePath() string { return filepath.Join(cacheDir(), sessionCacheFile) }
-func sessionCachePathForOAuth(token string) string {
-	return filepath.Join(cacheDir(), "github_copilot_session_"+fingerprint(token)+".json")
+// oauthSessionPath keys a BYOC session cache by a non-reversible fingerprint of
+// its OAuth token, so different users never share a session file.
+func (c Config) oauthSessionPath(token string) string {
+	return c.cachePath("github_copilot_session_" + fingerprint(token) + ".json")
 }
 
 func fingerprint(token string) string {
@@ -120,6 +194,9 @@ func fingerprint(token string) string {
 }
 
 func readJSON(path string) map[string]any {
+	if path == "" {
+		return nil
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil
@@ -132,6 +209,9 @@ func readJSON(path string) map[string]any {
 }
 
 func writeJSONSecret(path string, payload map[string]any) {
+	if path == "" {
+		return
+	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	b, _ := json.Marshal(payload)
 	_ = os.WriteFile(path, b, 0o600)
@@ -139,23 +219,12 @@ func writeJSONSecret(path string, payload map[string]any) {
 
 // ---- OAuth token resolution --------------------------------------------- //
 
-func fromEnv() string {
-	if OAuthTokenFunc != nil {
-		if t := OAuthTokenFunc(); t != "" {
-			return t
-		}
-	}
-	if OAuthToken != "" {
-		return OAuthToken
-	}
-	if t := strings.TrimSpace(os.Getenv("GITHUB_COPILOT_OAUTH_TOKEN")); t != "" {
-		return t
-	}
-	return strings.TrimSpace(os.Getenv("LLMGW_GITHUB_COPILOT_OAUTH_TOKEN"))
+func (c Config) configuredOAuthToken() string {
+	return strings.TrimSpace(c.OAuthToken)
 }
 
-func fromCache() string {
-	data := readJSON(oauthCachePath())
+func (c Config) cachedOAuthToken() string {
+	data := readJSON(c.cachePath(oauthCacheFile))
 	if data == nil {
 		return ""
 	}
@@ -163,12 +232,8 @@ func fromCache() string {
 	return strings.TrimSpace(t)
 }
 
-func fromGhCLI() string {
-	useGh := UseGhCLI
-	if UseGhCLIFunc != nil {
-		useGh = UseGhCLIFunc()
-	}
-	if !useGh {
+func (c Config) ghCLIToken() string {
+	if !c.UseGhCLI {
 		return ""
 	}
 	gh, err := exec.LookPath("gh")
@@ -183,53 +248,63 @@ func fromGhCLI() string {
 	return strings.TrimSpace(string(out))
 }
 
-// AssertProxyAllowed raises AuthError unless the copilot proxy is enabled.
-func AssertProxyAllowed() error {
-	enabled := AllowProxy
-	if AllowProxyFunc != nil {
-		enabled = AllowProxyFunc()
-	}
-	if !enabled {
-		v := strings.ToLower(strings.TrimSpace(os.Getenv("LLMGW_EXPERIMENTAL_COPILOT_PROVIDER")))
-		enabled = v == "1" || v == "true" || v == "yes" || v == "on"
-	}
-	if !enabled {
-		return &AuthError{Msg: "github_copilot provider is disabled by default (personal-use grey " +
-			"area). Enable it for your own loopback gateway with allow_copilot_proxy: true or " +
-			"LLMGW_EXPERIMENTAL_COPILOT_PROVIDER=1."}
-	}
-	return nil
-}
-
-// ResolveOAuthToken finds a usable GitHub OAuth token or returns AuthError.
-func ResolveOAuthToken() (string, error) {
-	for _, src := range []func() string{fromEnv, fromCache, fromGhCLI} {
-		if t := src(); t != "" {
+func (c Config) resolveOAuthToken() (string, error) {
+	for _, source := range []func() string{c.configuredOAuthToken, c.cachedOAuthToken, c.ghCLIToken} {
+		if t := source(); t != "" {
 			return t, nil
 		}
 	}
-	return "", &AuthError{Msg: "no GitHub Copilot OAuth token available. Sign in via the /admin " +
-		"panel, set LLMGW_GITHUB_COPILOT_OAUTH_TOKEN, or `gh auth refresh -s copilot` then `gh auth token`."}
+	return "", &AuthError{Msg: "no GitHub Copilot OAuth token available.", Err: ErrNoOAuthToken}
+}
+
+// AssertProxyAllowed returns an AuthError matching ErrProxyDisabled unless the
+// product enabled Copilot use with Config.AllowProxy.
+func (c *Client) AssertProxyAllowed() error {
+	if c.settings().AllowProxy {
+		return nil
+	}
+	return &AuthError{
+		Msg: "github_copilot provider is disabled by default (personal-use grey area).",
+		Err: ErrProxyDisabled,
+	}
+}
+
+// ResolveOAuthToken returns the first OAuth token from Config.OAuthToken, the
+// disk cache, and the gh CLI, in that order. Without one it returns an
+// AuthError matching ErrNoOAuthToken.
+func (c *Client) ResolveOAuthToken() (string, error) {
+	return c.settings().resolveOAuthToken()
 }
 
 // ---- session token ------------------------------------------------------ //
 
-func copilotHeaders() map[string]string {
+func (c Config) copilotHeaders() map[string]string {
+	editorVersion := c.EditorVersion
+	if editorVersion == "" {
+		editorVersion = DefaultEditorVersion
+	}
+	pluginVersion := c.EditorPluginVersion
+	if pluginVersion == "" {
+		pluginVersion = DefaultEditorPluginVersion
+	}
 	return map[string]string{
 		"Accept":                "application/json",
-		"Editor-Version":        EditorVersion,
-		"Editor-Plugin-Version": EditorPluginVersion,
-		"User-Agent":            "GithubCopilot/" + EditorPluginVersion,
+		"Editor-Version":        editorVersion,
+		"Editor-Plugin-Version": pluginVersion,
+		"User-Agent":            "GithubCopilot/" + pluginVersion,
 	}
 }
 
-func exchangeOAuthForSession(oauthToken string) (*Session, error) {
-	req, _ := http.NewRequest("GET", SessionTokenURL, nil)
-	for k, v := range copilotHeaders() {
+func (c Config) exchangeOAuthForSession(oauthToken string) (*Session, error) {
+	req, err := http.NewRequest("GET", c.endpoints().SessionTokenURL, nil)
+	if err != nil {
+		return nil, newAuthError(0, "Copilot session-token request is invalid: "+err.Error())
+	}
+	for k, v := range c.copilotHeaders() {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Authorization", "token "+oauthToken)
-	resp, err := httpClient().Do(req)
+	resp, err := c.client().Do(req)
 	if err != nil {
 		authErr := newAuthError(0, "Copilot session-token transport error: "+err.Error())
 		authErr.Transport = true
@@ -237,8 +312,10 @@ func exchangeOAuthForSession(oauthToken string) (*Session, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 401 {
-		return nil, newAuthError(resp.StatusCode, "Copilot session-token exchange returned 401: the OAuth token "+
-			"is invalid or lacks Copilot access. Sign in via the /admin panel.")
+		authErr := newAuthError(resp.StatusCode, "Copilot session-token exchange returned 401: the OAuth token "+
+			"is invalid or lacks Copilot access.")
+		authErr.Err = ErrOAuthTokenRejected
+		return nil, authErr
 	}
 	if resp.StatusCode >= 400 {
 		return nil, newAuthError(resp.StatusCode, fmt.Sprintf("Copilot session-token exchange failed (%d)", resp.StatusCode))
@@ -293,52 +370,47 @@ func cachedSessionAt(path, oauthToken string) *Session {
 }
 
 func storeSessionAt(path, oauthToken string, s *Session) {
-	ensureCacheDir()
 	writeJSONSecret(path, map[string]any{
 		"fingerprint": fingerprint(oauthToken), "token": s.Token,
 		"chat_base_url": s.ChatBaseURL, "expires_at": s.ExpiresAt,
 	})
 }
 
-// GetSession returns a fresh-enough Copilot session token, refreshing on demand.
-func GetSession(forceRefresh bool) (*Session, error) {
-	oauthToken, err := ResolveOAuthToken()
-	if err != nil {
-		return nil, err
-	}
-	if !forceRefresh {
-		if c := cachedSessionAt(sessionCachePath(), oauthToken); c != nil {
-			return c, nil
-		}
-	}
-	s, err := exchangeOAuthForSession(oauthToken)
-	if err != nil {
-		return nil, err
-	}
-	storeSessionAt(sessionCachePath(), oauthToken, s)
-	return s, nil
-}
-
-// GetSessionForOAuth resolves an isolated Copilot session for one BYOC OAuth
-// credential. Its cache file is keyed by a non-reversible token fingerprint, so
-// multiple users never overwrite or reuse each other's session token.
-func GetSessionForOAuth(oauthToken string, forceRefresh bool) (*Session, error) {
-	oauthToken = strings.TrimSpace(oauthToken)
-	if oauthToken == "" {
-		return nil, &AuthError{Msg: "Copilot OAuth token is empty"}
-	}
-	path := sessionCachePathForOAuth(oauthToken)
+func (c Config) session(path, oauthToken string, forceRefresh bool) (*Session, error) {
 	if !forceRefresh {
 		if cached := cachedSessionAt(path, oauthToken); cached != nil {
 			return cached, nil
 		}
 	}
-	session, err := exchangeOAuthForSession(oauthToken)
+	session, err := c.exchangeOAuthForSession(oauthToken)
 	if err != nil {
 		return nil, err
 	}
 	storeSessionAt(path, oauthToken, session)
 	return session, nil
+}
+
+// GetSession returns a fresh-enough Copilot session token for the resolved
+// OAuth token, refreshing on demand.
+func (c *Client) GetSession(forceRefresh bool) (*Session, error) {
+	config := c.settings()
+	oauthToken, err := config.resolveOAuthToken()
+	if err != nil {
+		return nil, err
+	}
+	return config.session(config.cachePath(sessionCacheFile), oauthToken, forceRefresh)
+}
+
+// GetSessionForOAuth resolves an isolated Copilot session for one BYOC OAuth
+// credential. Its cache file is keyed by a non-reversible token fingerprint, so
+// multiple users never overwrite or reuse each other's session token.
+func (c *Client) GetSessionForOAuth(oauthToken string, forceRefresh bool) (*Session, error) {
+	oauthToken = strings.TrimSpace(oauthToken)
+	if oauthToken == "" {
+		return nil, &AuthError{Msg: "Copilot OAuth token is empty"}
+	}
+	config := c.settings()
+	return config.session(config.oauthSessionPath(oauthToken), oauthToken, forceRefresh)
 }
 
 // ---- device-code flow --------------------------------------------------- //
@@ -352,12 +424,16 @@ type DeviceCode struct {
 	ExpiresIn       int    `json:"expires_in"`
 }
 
-func StartDeviceFlow() (*DeviceCode, error) {
+func (c *Client) StartDeviceFlow() (*DeviceCode, error) {
+	config := c.settings()
 	form := url.Values{"client_id": {ClientID}, "scope": {"read:user"}}
-	req, _ := http.NewRequest("POST", DeviceCodeURL, strings.NewReader(form.Encode()))
+	req, err := http.NewRequest("POST", config.endpoints().DeviceCodeURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, newAuthError(0, "device-code request is invalid: "+err.Error())
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := httpClient().Do(req)
+	resp, err := config.client().Do(req)
 	if err != nil {
 		return nil, newAuthError(0, "device-code request failed: "+err.Error())
 	}
@@ -401,9 +477,9 @@ type DevicePollResult struct {
 
 // lockDevicePoll serializes concurrent polls for one device code. This preserves
 // provider-required sequential polling while allowing a browser to resume later.
-func lockDevicePoll(deviceCode string) func() {
+func (c *Client) lockDevicePoll(deviceCode string) func() {
 	key := strings.TrimSpace(deviceCode)
-	value, _ := devicePollLocks.LoadOrStore(key, &sync.Mutex{})
+	value, _ := c.polls.LoadOrStore(key, &sync.Mutex{})
 	lock := value.(*sync.Mutex)
 	lock.Lock()
 	return lock.Unlock
@@ -411,18 +487,25 @@ func lockDevicePoll(deviceCode string) func() {
 
 // PollDeviceFlowTokenOnce performs one non-blocking device-flow poll and returns
 // the OAuth token to the caller without persisting or exposing it in JSON.
-func PollDeviceFlowTokenOnce(deviceCode string) DevicePollResult {
-	unlock := lockDevicePoll(deviceCode)
+func (c *Client) PollDeviceFlowTokenOnce(deviceCode string) DevicePollResult {
+	return c.pollDeviceFlow(c.settings(), deviceCode)
+}
+
+func (c *Client) pollDeviceFlow(config Config, deviceCode string) DevicePollResult {
+	unlock := c.lockDevicePoll(deviceCode)
 	defer unlock()
 	form := url.Values{
 		"client_id":   {ClientID},
 		"device_code": {deviceCode},
 		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
 	}
-	req, _ := http.NewRequest("POST", AccessTokenURL, strings.NewReader(form.Encode()))
+	req, err := http.NewRequest("POST", config.endpoints().AccessTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return DevicePollResult{Status: "error", Error: sanitize.SanitizeTextLimit("invalid request: "+err.Error(), maxAuthDiagnosticChars)}
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := httpClient().Do(req)
+	resp, err := config.client().Do(req)
 	if err != nil {
 		return DevicePollResult{Status: "error", Error: sanitize.SanitizeTextLimit("transport error: "+err.Error(), maxAuthDiagnosticChars)}
 	}
@@ -450,11 +533,17 @@ func PollDeviceFlowTokenOnce(deviceCode string) DevicePollResult {
 }
 
 // PollDeviceFlowOnce is the legacy single-operator flow. It persists the token
-// to the global Copilot cache and returns a secret-free status envelope.
-func PollDeviceFlowOnce(deviceCode string) map[string]any {
-	result := PollDeviceFlowTokenOnce(deviceCode)
+// to the Copilot cache and returns a secret-free status envelope. It refuses to
+// poll without a CacheDir, because an authorized token it cannot store would be
+// lost and the one-time device code spent.
+func (c *Client) PollDeviceFlowOnce(deviceCode string) map[string]any {
+	config := c.settings()
+	if config.CacheDir == "" {
+		return map[string]any{"status": "error", "error": "Copilot cache directory is not configured"}
+	}
+	result := c.pollDeviceFlow(config, deviceCode)
 	if result.Status == "authorized" {
-		persistOAuthToken(result.AccessToken)
+		config.persistOAuthToken(result.AccessToken)
 	}
 	out := map[string]any{"status": result.Status}
 	if result.Error != "" {
@@ -463,34 +552,34 @@ func PollDeviceFlowOnce(deviceCode string) map[string]any {
 	return out
 }
 
-func persistOAuthToken(token string) {
-	ensureCacheDir()
-	writeJSONSecret(oauthCachePath(), map[string]any{
+func (c Config) persistOAuthToken(token string) {
+	writeJSONSecret(c.cachePath(oauthCacheFile), map[string]any{
 		"access_token": token, "stored_at": time.Now().Unix(),
 	})
 }
 
 // ClearCachedCredentials removes cached OAuth + session tokens.
-func ClearCachedCredentials() map[string]bool {
+func (c *Client) ClearCachedCredentials() map[string]bool {
+	config := c.settings()
 	removed := map[string]bool{}
-	for label, path := range map[string]string{"oauth": oauthCachePath(), "session": sessionCachePath()} {
-		removed[label] = os.Remove(path) == nil
+	for label, name := range map[string]string{"oauth": oauthCacheFile, "session": sessionCacheFile} {
+		path := config.cachePath(name)
+		removed[label] = path != "" && os.Remove(path) == nil
 	}
 	return removed
 }
 
-// AuthStatus is a diagnostic snapshot for the /admin panel.
-func AuthStatus() map[string]any {
-	useGh := UseGhCLI
-	if UseGhCLIFunc != nil {
-		useGh = UseGhCLIFunc()
-	}
-	env := fromEnv()
-	cache := fromCache()
-	gh := fromGhCLI()
+// AuthStatus is a diagnostic snapshot for an admin surface. The "env"
+// active_source and env_present keys describe Config.OAuthToken; they keep the
+// names existing status consumers already read.
+func (c *Client) AuthStatus() map[string]any {
+	config := c.settings()
+	configured := config.configuredOAuthToken()
+	cache := config.cachedOAuthToken()
+	gh := config.ghCLIToken()
 	var active any
 	switch {
-	case env != "":
+	case configured != "":
 		active = "env"
 	case cache != "":
 		active = "cache"
@@ -499,10 +588,10 @@ func AuthStatus() map[string]any {
 	}
 	return map[string]any{
 		"active_source":  active,
-		"env_present":    env != "",
+		"env_present":    configured != "",
 		"cache_present":  cache != "",
 		"gh_cli_present": gh != "",
-		"use_gh_cli":     useGh,
-		"cache_dir":      cacheDir(),
+		"use_gh_cli":     config.UseGhCLI,
+		"cache_dir":      config.CacheDir,
 	}
 }

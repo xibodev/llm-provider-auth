@@ -15,7 +15,7 @@ import (
 // with a real key. It is skipped unless LLMGW_LIVE_GCP_KEY names a key file, so
 // the default suite stays hermetic and needs no credential.
 //
-//	LLMGW_LIVE_GCP_KEY=/path/to/key.json go test ./internal/gcpauth -run Live -v
+//	LLMGW_LIVE_GCP_KEY=/path/to/key.json go test ./gcp -run Live -v
 //
 // The key is read from disk by this test and never printed: only the
 // non-secret metadata and the token's reported scope and lifetime are logged.
@@ -37,8 +37,8 @@ func TestLiveServiceAccountMintsToken(t *testing.T) {
 	t.Logf("key: project=%s client_email=%s key_id=%s",
 		meta.ProjectID, meta.ClientEmail, meta.PrivateKeyID)
 
-	ResetCache()
-	token, err := AccessToken(credential, CloudPlatformScope)
+	cache := &TokenCache{}
+	token, err := cache.AccessToken(credential, CloudPlatformScope)
 	if err != nil {
 		t.Fatalf("AccessToken against the live endpoint: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestLiveServiceAccountMintsToken(t *testing.T) {
 
 	// A second call must be served from cache rather than re-minting.
 	before := time.Now()
-	again, err := AccessToken(credential, CloudPlatformScope)
+	again, err := cache.AccessToken(credential, CloudPlatformScope)
 	if err != nil {
 		t.Fatalf("second AccessToken: %v", err)
 	}
