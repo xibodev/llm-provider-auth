@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -9,11 +10,28 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
+// fixtureConfig points every OAuth endpoint at one test server, so each test
+// owns its configuration and tests run in parallel.
+func fixtureConfig(server *httptest.Server, clientID string) Config {
+	return Config{
+		ClientID: clientID,
+		Endpoints: Endpoints{
+			UserCodeURL:    server.URL + "/usercode",
+			DeviceTokenURL: server.URL + "/device-token",
+			OAuthTokenURL:  server.URL + "/oauth-token",
+			RevokeURL:      server.URL + "/oauth-revoke",
+		},
+		HTTPClient: server.Client(),
+	}
+}
+
 func TestOfficialDeviceFlowUsesJSONPollsPendingAndExchangesPollReturnedPKCE(t *testing.T) {
-	polls := 0
+	t.Parallel()
+	var polls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -33,12 +51,12 @@ func TestOfficialDeviceFlowUsesJSONPollsPendingAndExchangesPollReturnedPKCE(t *t
 			if body["device_auth_id"] != "device-1" || body["user_code"] != "CODE-123" || len(body) != 2 {
 				t.Fatalf("device-token body=%+v", body)
 			}
-			polls++
-			if polls == 1 {
+			poll := polls.Add(1)
+			if poll == 1 {
 				w.WriteHeader(http.StatusForbidden)
 				return
 			}
-			if polls == 2 {
+			if poll == 2 {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
@@ -59,11 +77,9 @@ func TestOfficialDeviceFlowUsesJSONPollsPendingAndExchangesPollReturnedPKCE(t *t
 		}
 	}))
 	defer server.Close()
-	oldUser, oldDevice, oldToken := UserCodeURL, DeviceTokenURL, OAuthTokenURL
-	UserCodeURL, DeviceTokenURL, OAuthTokenURL = server.URL+"/usercode", server.URL+"/device-token", server.URL+"/oauth-token"
-	t.Cleanup(func() { UserCodeURL, DeviceTokenURL, OAuthTokenURL = oldUser, oldDevice, oldToken })
+	config := fixtureConfig(server, "fixture-client")
 
-	flow, err := StartDeviceFlow("fixture-client")
+	flow, err := config.StartDeviceFlow(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +87,7 @@ func TestOfficialDeviceFlowUsesJSONPollsPendingAndExchangesPollReturnedPKCE(t *t
 		t.Fatalf("flow=%+v", flow)
 	}
 	for _, want := range []string{"pending", "pending", "authorized"} {
-		status, tokens, err := PollAndExchange(flow)
+		status, tokens, err := config.PollAndExchange(context.Background(), flow)
 		if err != nil || status != want {
 			t.Fatalf("poll=%s tokens=%+v err=%v want=%s", status, tokens, err, want)
 		}
@@ -82,16 +98,15 @@ func TestOfficialDeviceFlowUsesJSONPollsPendingAndExchangesPollReturnedPKCE(t *t
 }
 
 func TestSyntheticDeviceDenialCodeIsSanitizedAndInspectable(t *testing.T) {
+	t.Parallel()
 	secret := "llmgw_" + strings.Repeat("c", 32)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = fmt.Fprintf(w, `{"error":"Bearer malicious owner@example.test api_key=%s %s"}`, secret, strings.Repeat("x", 700))
 	}))
 	defer server.Close()
-	old := DeviceTokenURL
-	DeviceTokenURL = server.URL
-	t.Cleanup(func() { DeviceTokenURL = old })
-	status, _, err := PollAndExchange(DeviceFlow{DeviceAuthID: "device", UserCode: "code"})
+	config := fixtureConfig(server, "synthetic-client")
+	status, _, err := config.PollAndExchange(context.Background(), DeviceFlow{DeviceAuthID: "device", UserCode: "code"})
 	authErr := &AuthError{}
 	if status != "denied" || !errors.As(err, &authErr) || authErr.StatusCode != http.StatusBadRequest || len([]rune(authErr.Code)) > maxAuthDiagnosticChars || strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "malicious") || strings.Contains(err.Error(), "owner@example.test") {
 		t.Fatalf("status=%q error=%v authError=%+v", status, err, authErr)
@@ -99,16 +114,14 @@ func TestSyntheticDeviceDenialCodeIsSanitizedAndInspectable(t *testing.T) {
 }
 
 func TestSyntheticRefreshDescriptionIsSanitizedAndCodePreserved(t *testing.T) {
+	t.Parallel()
 	secret := "llmgw_" + strings.Repeat("d", 32)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = fmt.Fprintf(w, `{"error":"invalid_grant","error_description":"Bearer malicious owner@example.test api_key=%s %s"}`, secret, strings.Repeat("y", 700))
 	}))
 	defer server.Close()
-	old := OAuthTokenURL
-	OAuthTokenURL = server.URL
-	t.Cleanup(func() { OAuthTokenURL = old })
-	_, err := Refresh("synthetic-client", "synthetic-refresh")
+	_, err := fixtureConfig(server, "synthetic-client").Refresh(context.Background(), "synthetic-refresh")
 	refreshErr := &RefreshError{}
 	if !errors.As(err, &refreshErr) || refreshErr.StatusCode != http.StatusUnauthorized || refreshErr.Code != "invalid_grant" || len([]rune(refreshErr.Description)) > maxAuthDiagnosticChars || strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "malicious") || strings.Contains(err.Error(), "owner@example.test") {
 		t.Fatalf("error=%v refreshError=%+v", err, refreshErr)
@@ -116,6 +129,7 @@ func TestSyntheticRefreshDescriptionIsSanitizedAndCodePreserved(t *testing.T) {
 }
 
 func TestTypedErrorFinalMessagesAreSanitizedAndBounded(t *testing.T) {
+	t.Parallel()
 	secret := "llmgw_" + strings.Repeat("f", 32)
 	code := strings.Repeat("c", maxAuthDiagnosticChars-len(secret)) + secret
 	description := strings.Repeat("d", maxAuthDiagnosticChars-len("owner@example.test")) + "owner@example.test"
@@ -124,6 +138,7 @@ func TestTypedErrorFinalMessagesAreSanitizedAndBounded(t *testing.T) {
 		"refresh": &RefreshError{StatusCode: http.StatusUnauthorized, Code: code, Description: description},
 	} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			message := err.Error()
 			if len([]rune(message)) > maxAuthDiagnosticChars || strings.Contains(message, secret) || strings.Contains(message, "owner@example.test") {
 				t.Fatalf("unsafe or unbounded final error: %q", message)
@@ -133,11 +148,13 @@ func TestTypedErrorFinalMessagesAreSanitizedAndBounded(t *testing.T) {
 }
 
 func TestSyntheticTransportQueryIsSanitized(t *testing.T) {
-	oldURL, oldClient := RevokeURL, HTTPClient
-	RevokeURL = "http://127.0.0.1:1/revoke?access_token=query-secret&owner=owner@example.test"
-	HTTPClient = func() *http.Client { return &http.Client{} }
-	t.Cleanup(func() { RevokeURL, HTTPClient = oldURL, oldClient })
-	err := Revoke("synthetic-client", "synthetic-refresh", "")
+	t.Parallel()
+	config := Config{
+		ClientID:   "synthetic-client",
+		Endpoints:  Endpoints{RevokeURL: "http://127.0.0.1:1/revoke?access_token=query-secret&owner=owner@example.test"},
+		HTTPClient: &http.Client{},
+	}
+	err := config.Revoke(context.Background(), "synthetic-refresh", "")
 	authErr := &AuthError{}
 	if err == nil || !errors.As(err, &authErr) || authErr.StatusCode != 0 || authErr.Code != "transport" || strings.Contains(err.Error(), "query-secret") || strings.Contains(err.Error(), "owner@example.test") || len([]rune(err.Error())) > maxAuthDiagnosticChars {
 		t.Fatalf("unsafe transport error: %v", err)
@@ -145,9 +162,11 @@ func TestSyntheticTransportQueryIsSanitized(t *testing.T) {
 }
 
 func TestRefreshReturnsTypedInvalidReusedAndExpiredErrors(t *testing.T) {
+	t.Parallel()
 	cases := []string{"invalid_grant", "refresh_token_reused", "expired_token"}
 	for _, code := range cases {
 		t.Run(code, func(t *testing.T) {
+			t.Parallel()
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
 					t.Fatalf("refresh request=%s content-type=%q", r.Method, r.Header.Get("Content-Type"))
@@ -162,10 +181,7 @@ func TestRefreshReturnsTypedInvalidReusedAndExpiredErrors(t *testing.T) {
 				_, _ = w.Write([]byte(`{"error":"` + code + `","error_description":"fixture failure"}`))
 			}))
 			defer server.Close()
-			old := OAuthTokenURL
-			OAuthTokenURL = server.URL
-			t.Cleanup(func() { OAuthTokenURL = old })
-			_, err := Refresh("fixture-client", "fixture-refresh")
+			_, err := fixtureConfig(server, "fixture-client").Refresh(context.Background(), "fixture-refresh")
 			refreshError := &RefreshError{}
 			if err == nil || !asRefreshError(err, refreshError) || refreshError.StatusCode != http.StatusBadRequest || refreshError.Code != code {
 				t.Fatalf("refresh err=%v status=%d code=%q", err, refreshError.StatusCode, refreshError.Code)
@@ -175,6 +191,7 @@ func TestRefreshReturnsTypedInvalidReusedAndExpiredErrors(t *testing.T) {
 }
 
 func TestRefreshDerivesExpiryFromAccessTokenJWT(t *testing.T) {
+	t.Parallel()
 	accessToken := "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1900000000}`)) + ".signature"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -182,19 +199,16 @@ func TestRefreshDerivesExpiryFromAccessTokenJWT(t *testing.T) {
 	}))
 	defer server.Close()
 
-	old := OAuthTokenURL
-	OAuthTokenURL = server.URL
-	t.Cleanup(func() { OAuthTokenURL = old })
-
-	tokens, err := Refresh("fixture-client", "fixture-refresh")
+	tokens, err := fixtureConfig(server, "fixture-client").Refresh(context.Background(), "fixture-refresh")
 	if err != nil || tokens.ExpiresAt != 1900000000 {
 		t.Fatalf("tokens=%+v err=%v", tokens, err)
 	}
 }
 
 func TestRefreshAndRevokeUseOfficialJSONAndIDTokenClaims(t *testing.T) {
+	t.Parallel()
 	idToken := "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"email":"fixture@example.test","https://api.openai.com/auth":{"chatgpt_account_id":"workspace-42"}}`)) + ".signature"
-	revocations := 0
+	var revocations atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -206,16 +220,16 @@ func TestRefreshAndRevokeUseOfficialJSONAndIDTokenClaims(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"access_token":"new-access","refresh_token":"new-refresh","id_token":"` + idToken + `"}`))
 		case "/oauth/revoke":
-			revocations++
+			revocation := revocations.Add(1)
 			body := map[string]string{}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			if r.Header.Get("Content-Type") != "application/json" {
 				t.Fatalf("revoke content-type=%q", r.Header.Get("Content-Type"))
 			}
-			if revocations == 1 && (body["token"] != "fixture-refresh" || body["token_type_hint"] != "refresh_token" || body["client_id"] != "fixture-client" || len(body) != 3) {
+			if revocation == 1 && (body["token"] != "fixture-refresh" || body["token_type_hint"] != "refresh_token" || body["client_id"] != "fixture-client" || len(body) != 3) {
 				t.Fatalf("refresh revoke body=%+v", body)
 			}
-			if revocations == 2 && (body["token"] != "fixture-access" || body["token_type_hint"] != "access_token" || body["client_id"] != "" || len(body) != 2) {
+			if revocation == 2 && (body["token"] != "fixture-access" || body["token_type_hint"] != "access_token" || body["client_id"] != "" || len(body) != 2) {
 				t.Fatalf("access revoke body=%+v", body)
 			}
 		default:
@@ -223,22 +237,24 @@ func TestRefreshAndRevokeUseOfficialJSONAndIDTokenClaims(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	oldToken, oldRevoke := OAuthTokenURL, RevokeURL
-	OAuthTokenURL, RevokeURL = server.URL+"/oauth/token", server.URL+"/oauth/revoke"
-	t.Cleanup(func() { OAuthTokenURL, RevokeURL = oldToken, oldRevoke })
+	config := Config{
+		ClientID:   "fixture-client",
+		Endpoints:  Endpoints{OAuthTokenURL: server.URL + "/oauth/token", RevokeURL: server.URL + "/oauth/revoke"},
+		HTTPClient: server.Client(),
+	}
 
-	tokens, err := Refresh("fixture-client", "fixture-refresh")
+	tokens, err := config.Refresh(context.Background(), "fixture-refresh")
 	if err != nil || tokens.AccessToken != "new-access" || tokens.AccountID != "workspace-42" || tokens.AccountLabel != "fixture@example.test" {
 		t.Fatalf("tokens=%+v err=%v", tokens, err)
 	}
-	if err := Revoke("fixture-client", "fixture-refresh", "fixture-access"); err != nil {
+	if err := config.Revoke(context.Background(), "fixture-refresh", "fixture-access"); err != nil {
 		t.Fatal(err)
 	}
-	if err := Revoke("fixture-client", "", "fixture-access"); err != nil {
+	if err := config.Revoke(context.Background(), "", "fixture-access"); err != nil {
 		t.Fatal(err)
 	}
-	if revocations != 2 {
-		t.Fatalf("revocations=%d", revocations)
+	if got := revocations.Load(); got != 2 {
+		t.Fatalf("revocations=%d", got)
 	}
 }
 

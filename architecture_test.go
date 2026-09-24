@@ -21,29 +21,11 @@ var environmentReaders = map[string]bool{
 	"UserHomeDir": true, "UserCacheDir": true, "UserConfigDir": true,
 }
 
-// pendingPackageState lists package-level variables that are still mutable
-// state. Each entry needs a reason; the list only shrinks.
-func pendingPackageState() map[string]string {
-	codex := "codex still reads its endpoints, client version and HTTP client from package variables; issue #4 moves them to an explicit Config"
-	return map[string]string{
-		"codex.UserCodeURL":      codex,
-		"codex.DeviceTokenURL":   codex,
-		"codex.OAuthTokenURL":    codex,
-		"codex.RevokeURL":        codex,
-		"codex.ResponsesBaseURL": codex,
-		"codex.ModelsURL":        codex,
-		"codex.ClientVersion":    codex,
-		"codex.HTTPClient":       codex,
-	}
-}
-
 // TestLibraryKeepsNoAmbientState enforces that library code reads no
 // environment variables, runs no init functions, and declares no mutable
 // package-level variables. Sentinel errors and compiled regular expressions
 // are immutable by convention and allowed.
 func TestLibraryKeepsNoAmbientState(t *testing.T) {
-	pending := pendingPackageState()
-	seen := map[string]bool{}
 	var problems []string
 
 	fileSet := token.NewFileSet()
@@ -111,10 +93,6 @@ func TestLibraryKeepsNoAmbientState(t *testing.T) {
 							continue
 						}
 						qualified := file.Name.Name + "." + name.Name
-						if _, ok := pending[qualified]; ok {
-							seen[qualified] = true
-							continue
-						}
 						problems = append(problems, location(name)+": package-level variable "+qualified)
 					}
 				}
@@ -124,11 +102,6 @@ func TestLibraryKeepsNoAmbientState(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
-	}
-	for name := range pending {
-		if !seen[name] {
-			problems = append(problems, "pending entry "+name+" no longer exists; remove it from pendingPackageState")
-		}
 	}
 	sort.Strings(problems)
 	for _, problem := range problems {

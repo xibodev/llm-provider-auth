@@ -8,6 +8,7 @@ import (
 )
 
 func TestRefreshErrorTerminalClassification(t *testing.T) {
+	t.Parallel()
 	for code, want := range map[string]bool{
 		"invalid_grant": true, "refresh_token_reused": true, "expired_token": true,
 		"server_error": false, "missing_refresh_token": false, "": false,

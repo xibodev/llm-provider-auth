@@ -1,7 +1,13 @@
+// Package codex runs the OpenAI Codex device authorization flow and exchanges,
+// refreshes and revokes the resulting ChatGPT OAuth tokens.
+//
+// The package keeps no process-wide state. The caller supplies a Config, so
+// separate configurations, and tests, share nothing.
 package codex
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -18,21 +24,48 @@ import (
 
 const maxAuthDiagnosticChars = 512
 
-var (
-	UserCodeURL      = "https://auth.openai.com/api/accounts/deviceauth/usercode"
-	DeviceTokenURL   = "https://auth.openai.com/api/accounts/deviceauth/token"
-	OAuthTokenURL    = "https://auth.openai.com/oauth/token"
-	RevokeURL        = "https://auth.openai.com/oauth/revoke"
+const (
+	// Canonical OpenAI OAuth endpoints. Empty Config.Endpoints fields fall
+	// back to them.
+	UserCodeURL    = "https://auth.openai.com/api/accounts/deviceauth/usercode"
+	DeviceTokenURL = "https://auth.openai.com/api/accounts/deviceauth/token"
+	OAuthTokenURL  = "https://auth.openai.com/oauth/token"
+	RevokeURL      = "https://auth.openai.com/oauth/revoke"
+
+	// Canonical Codex API endpoints. This package never calls them; they are
+	// the defaults for consumers that do.
 	ResponsesBaseURL = "https://chatgpt.com/backend-api/codex"
 	ModelsURL        = "https://chatgpt.com/backend-api/codex/models"
-	ClientVersion    = "llm-gateway/0.4"
-	HTTPClient       = func() *http.Client { return &http.Client{Timeout: 20 * time.Second} }
+
+	// defaultTimeout bounds each request when Config.HTTPClient is nil.
+	defaultTimeout = 20 * time.Second
 )
 
 const (
 	DeviceVerificationURL = "https://auth.openai.com/codex/device"
 	DeviceAuthRedirectURI = "https://auth.openai.com/deviceauth/callback"
 )
+
+// Endpoints allows tests and compatible deployments to replace the OpenAI
+// OAuth URLs. Empty fields use the canonical endpoints.
+type Endpoints struct {
+	UserCodeURL    string
+	DeviceTokenURL string
+	OAuthTokenURL  string
+	RevokeURL      string
+}
+
+// Config contains caller-owned Codex OAuth configuration. Values are never
+// discovered implicitly, and each operation validates only what it sends.
+type Config struct {
+	// ClientID identifies the OpenAI OAuth client. An operation that sends it
+	// fails before any request when it is blank.
+	ClientID  string
+	Endpoints Endpoints
+	// HTTPClient performs every request. Nil uses a client that times out
+	// after 20 seconds.
+	HTTPClient *http.Client
+}
 
 type DeviceFlow struct {
 	DeviceAuthID    string
@@ -109,16 +142,21 @@ func (e *RefreshError) Error() string {
 	return sanitize.SanitizeTextLimit(message, maxAuthDiagnosticChars)
 }
 
-func StartDeviceFlow(clientID string) (DeviceFlow, error) {
-	clientID = strings.TrimSpace(clientID)
-	if clientID == "" {
-		return DeviceFlow{}, fmt.Errorf("OpenAI Codex client ID is required")
+// StartDeviceFlow requests a device code. The caller shows the user code and
+// verification URI, then calls PollAndExchange every Interval seconds.
+func (c Config) StartDeviceFlow(ctx context.Context) (DeviceFlow, error) {
+	clientID := strings.TrimSpace(c.ClientID)
+	if err := requireClientID(clientID); err != nil {
+		return DeviceFlow{}, err
 	}
 	body, _ := json.Marshal(map[string]string{"client_id": clientID})
-	request, _ := http.NewRequest(http.MethodPost, UserCodeURL, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoints().UserCodeURL, bytes.NewReader(body))
+	if err != nil {
+		return DeviceFlow{}, authError("device authorization", 0, "request", err.Error())
+	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", "application/json")
-	response, err := HTTPClient().Do(request)
+	response, err := c.client().Do(request)
 	if err != nil {
 		return DeviceFlow{}, authError("device authorization", 0, "transport", err.Error())
 	}
@@ -153,12 +191,29 @@ func StartDeviceFlow(clientID string) (DeviceFlow, error) {
 	return flow, nil
 }
 
-func PollAndExchange(flow DeviceFlow) (string, TokenSet, error) {
+// PollAndExchange polls the device authorization once. It returns "pending" or
+// "slow_down" until the user approves, "expired" or "denied" when the flow
+// cannot complete, and "authorized" with the tokens from exchanging the
+// approved authorization code. The exchange uses flow.ClientID, the client
+// that started the flow, and falls back to Config.ClientID.
+func (c Config) PollAndExchange(ctx context.Context, flow DeviceFlow) (string, TokenSet, error) {
+	clientID := flow.ClientID
+	if strings.TrimSpace(clientID) == "" {
+		clientID = c.ClientID
+	}
+	// Check before polling: an approved poll hands over the authorization
+	// code, and an exchange that cannot run would strand the user's approval.
+	if err := requireClientID(clientID); err != nil {
+		return "error", TokenSet{}, err
+	}
 	body, _ := json.Marshal(map[string]string{"device_auth_id": flow.DeviceAuthID, "user_code": flow.UserCode})
-	request, _ := http.NewRequest(http.MethodPost, DeviceTokenURL, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoints().DeviceTokenURL, bytes.NewReader(body))
+	if err != nil {
+		return "error", TokenSet{}, authError("device token", 0, "request", err.Error())
+	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", "application/json")
-	response, err := HTTPClient().Do(request)
+	response, err := c.client().Do(request)
 	if err != nil {
 		return "error", TokenSet{}, authError("device token", 0, "transport", err.Error())
 	}
@@ -193,37 +248,54 @@ func PollAndExchange(flow DeviceFlow) (string, TokenSet, error) {
 	if verifier == "" {
 		return "error", TokenSet{}, fmt.Errorf("Codex device token response did not include code_verifier")
 	}
-	tokens, err := ExchangeAuthorizationCode(flow.ClientID, authorizationCode, verifier)
+	tokens, err := c.exchangeAuthorizationCode(ctx, clientID, authorizationCode, verifier)
 	if err != nil {
 		return "error", TokenSet{}, err
 	}
 	return "authorized", tokens, nil
 }
 
-func ExchangeAuthorizationCode(clientID, authorizationCode, verifier string) (TokenSet, error) {
+// ExchangeAuthorizationCode redeems a device-flow authorization code and its
+// PKCE verifier for tokens.
+func (c Config) ExchangeAuthorizationCode(ctx context.Context, code, verifier string) (TokenSet, error) {
+	if err := requireClientID(c.ClientID); err != nil {
+		return TokenSet{}, err
+	}
+	return c.exchangeAuthorizationCode(ctx, c.ClientID, code, verifier)
+}
+
+func (c Config) exchangeAuthorizationCode(ctx context.Context, clientID, code, verifier string) (TokenSet, error) {
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
 		"client_id":     {clientID},
-		"code":          {authorizationCode},
+		"code":          {code},
 		"code_verifier": {verifier},
 		"redirect_uri":  {DeviceAuthRedirectURI},
 	}
-	return tokenRequest(strings.NewReader(form.Encode()), "application/x-www-form-urlencoded", false)
+	return c.tokenRequest(ctx, strings.NewReader(form.Encode()), "application/x-www-form-urlencoded", false)
 }
 
-func Refresh(clientID, refreshToken string) (TokenSet, error) {
+// Refresh exchanges a refresh token for new tokens. A rejected grant returns a
+// *RefreshError whose Terminal method classifies it for tokenstore.
+func (c Config) Refresh(ctx context.Context, refreshToken string) (TokenSet, error) {
 	if strings.TrimSpace(refreshToken) == "" {
 		return TokenSet{}, &RefreshError{Code: "missing_refresh_token"}
 	}
+	if err := requireClientID(c.ClientID); err != nil {
+		return TokenSet{}, err
+	}
 	body, _ := json.Marshal(map[string]string{
-		"client_id":     clientID,
+		"client_id":     c.ClientID,
 		"grant_type":    "refresh_token",
 		"refresh_token": refreshToken,
 	})
-	return tokenRequest(bytes.NewReader(body), "application/json", true)
+	return c.tokenRequest(ctx, bytes.NewReader(body), "application/json", true)
 }
 
-func Revoke(clientID, refreshToken, accessToken string) error {
+// Revoke revokes the refresh token, or the access token when no refresh token
+// is given, and does nothing when both are blank. Only a refresh-token
+// revocation sends, and therefore requires, the client ID.
+func (c Config) Revoke(ctx context.Context, refreshToken, accessToken string) error {
 	token := strings.TrimSpace(refreshToken)
 	tokenTypeHint := "refresh_token"
 	if token == "" {
@@ -235,13 +307,19 @@ func Revoke(clientID, refreshToken, accessToken string) error {
 	}
 	payload := map[string]string{"token": token, "token_type_hint": tokenTypeHint}
 	if tokenTypeHint == "refresh_token" {
-		payload["client_id"] = clientID
+		if err := requireClientID(c.ClientID); err != nil {
+			return err
+		}
+		payload["client_id"] = c.ClientID
 	}
 	body, _ := json.Marshal(payload)
-	request, _ := http.NewRequest(http.MethodPost, RevokeURL, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoints().RevokeURL, bytes.NewReader(body))
+	if err != nil {
+		return authError("revoke", 0, "request", err.Error())
+	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", "application/json")
-	response, err := HTTPClient().Do(request)
+	response, err := c.client().Do(request)
 	if err != nil {
 		return authError("revoke", 0, "transport", err.Error())
 	}
@@ -252,11 +330,14 @@ func Revoke(clientID, refreshToken, accessToken string) error {
 	return nil
 }
 
-func tokenRequest(body io.Reader, contentType string, isRefresh bool) (TokenSet, error) {
-	request, _ := http.NewRequest(http.MethodPost, OAuthTokenURL, body)
+func (c Config) tokenRequest(ctx context.Context, body io.Reader, contentType string, isRefresh bool) (TokenSet, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoints().OAuthTokenURL, body)
+	if err != nil {
+		return TokenSet{}, authError("OAuth token", 0, "request", err.Error())
+	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", contentType)
-	response, err := HTTPClient().Do(request)
+	response, err := c.client().Do(request)
 	if err != nil {
 		return TokenSet{}, authError("OAuth token", 0, "transport", err.Error())
 	}
@@ -306,6 +387,39 @@ func tokenRequest(body io.Reader, contentType string, isRefresh bool) (TokenSet,
 		TokenType: firstString(payload, "token_type"), ExpiresAt: expiresAt,
 		AccountID: accountID, AccountLabel: accountLabel,
 	}, nil
+}
+
+func (c Config) endpoints() Endpoints {
+	result := c.Endpoints
+	if strings.TrimSpace(result.UserCodeURL) == "" {
+		result.UserCodeURL = UserCodeURL
+	}
+	if strings.TrimSpace(result.DeviceTokenURL) == "" {
+		result.DeviceTokenURL = DeviceTokenURL
+	}
+	if strings.TrimSpace(result.OAuthTokenURL) == "" {
+		result.OAuthTokenURL = OAuthTokenURL
+	}
+	if strings.TrimSpace(result.RevokeURL) == "" {
+		result.RevokeURL = RevokeURL
+	}
+	return result
+}
+
+func (c Config) client() *http.Client {
+	if c.HTTPClient != nil {
+		return c.HTTPClient
+	}
+	return &http.Client{Timeout: defaultTimeout}
+}
+
+// requireClientID rejects a blank client ID before any request, so a missing
+// configuration never reaches OpenAI as an empty client_id.
+func requireClientID(clientID string) error {
+	if strings.TrimSpace(clientID) == "" {
+		return fmt.Errorf("OpenAI Codex client ID is required")
+	}
+	return nil
 }
 
 func accessTokenExpiry(accessToken string) int64 {

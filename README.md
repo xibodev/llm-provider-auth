@@ -14,8 +14,9 @@ Each driver is an independent subpackage with zero unnecessary dependencies:
 - **`anthropic`**: Anthropic setup-token validation and request-header selection for setup tokens or API keys.
 - **`tokenstore`**: A storage contract and refresh coordinator that spend a rotating refresh token exactly once, even when several processes share one credential store. It includes an in-memory reference store and the `tokenstore/storetest` conformance suite.
 
-No package reads environment variables or runs an `init` function; callers
-supply all configuration explicitly. An architecture test enforces this.
+No package reads environment variables, runs an `init` function, or keeps
+mutable package-level state; callers supply all configuration explicitly. An
+architecture test enforces this.
 
 ## Installation
 
@@ -109,6 +110,51 @@ Earlier releases read `GITHUB_COPILOT_OAUTH_TOKEN`,
 maps those values onto `Config.OAuthToken`, `Config.CacheDir`,
 `Config.AllowProxy`, and `Config.UseGhCLI` itself.
 
+### OpenAI Codex Device Flow & Token Refresh
+
+```go
+import "github.com/xibodev/llm-provider-auth/codex"
+
+config := codex.Config{
+    ClientID: clientID, // the product's OpenAI OAuth client ID
+    // Endpoints: empty fields use the canonical OpenAI URLs.
+    // HTTPClient: nil uses a client that times out after 20 seconds.
+}
+
+flow, err := config.StartDeviceFlow(ctx)
+fmt.Printf("Visit %s and enter code: %s\n", flow.VerificationURI, flow.UserCode)
+
+// Poll every flow.Interval seconds while the status is "pending" or "slow_down".
+status, tokens, err := config.PollAndExchange(ctx, flow)
+if status == "authorized" {
+    // Persist tokens. OpenAI rotates refresh tokens; see tokenstore below.
+}
+tokens, err = config.Refresh(ctx, tokens.RefreshToken)
+err = config.Revoke(ctx, tokens.RefreshToken, tokens.AccessToken)
+```
+
+`codex` keeps no package state: a `Config` owns the client ID, endpoints, and
+HTTP client, and every operation takes a context. An operation that sends the
+client ID fails before any request when it is blank. `PollAndExchange`
+exchanges the code with `DeviceFlow.ClientID`, the client that started the
+flow, so a persisted flow completes even if the configured client changes.
+
+`ResponsesBaseURL` and `ModelsURL` are the canonical Codex API endpoints. This
+package never calls them; they are defaults for consumers that do.
+
+Migrating from v0.5.0:
+
+- `UserCodeURL`, `DeviceTokenURL`, `OAuthTokenURL`, `RevokeURL`,
+  `ResponsesBaseURL`, and `ModelsURL` are constants with the same names and
+  values. Reads still compile. Replace assignments with `Config.Endpoints` for
+  the OAuth URLs, or with the consumer's own settings for the Codex API URLs.
+- The `HTTPClient` variable is replaced by `Config.HTTPClient`.
+- `StartDeviceFlow`, `PollAndExchange`, `ExchangeAuthorizationCode`, `Refresh`,
+  and `Revoke` are `Config` methods that take a context. The client ID argument
+  moves to `Config.ClientID`.
+- `ClientVersion` is removed. This package never sent it; the consumer that
+  calls the Codex API supplies its own client version.
+
 ## Refresh-safe credential storage
 
 Providers such as OpenAI rotate refresh tokens and detect reuse: presenting an
@@ -128,8 +174,9 @@ A store implements `tokenstore.Store`:
 `tokenstore.Coordinator` combines the two guarantees:
 
 ```go
+codexConfig := codex.Config{ClientID: clientID}
 coordinator, err := tokenstore.NewCoordinator(store, func(ctx context.Context, current tokenstore.Record) (tokenstore.Record, error) {
-    tokens, err := codex.Refresh(clientID, current.RefreshToken)
+    tokens, err := codexConfig.Refresh(ctx, current.RefreshToken)
     if err != nil {
         return tokenstore.Record{}, err // *codex.RefreshError reports terminal grants
     }
